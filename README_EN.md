@@ -18,7 +18,7 @@ One traditional approach is `Justfile + rsync + sshpass`; we simply design the w
 **Compared with CI solutions, the cost of deploying from scratch is also lower**, because **Ferry does not rely on storage servers or containerized runner nodes, and works better on platforms that only have busybox.** <br>
 Even if you use a **FreeRTOS-based platform with busybox** such as k230 or MaixCAN, you can use Ferry to customize the workflow, potentially bypassing an inefficient or unfriendly original build process to some extent.
 
-Ferry does not strongly depend on your existing Makefile/CMake/GNinja experience; it pursues **a universal and diverse compositional build workflow**.
+Ferry does not strongly depend on your existing Makefile/CMake/GNinja experience; it pursues **a universal and diverse compositional build workflow**. <br>
 In other words, Ferry is more like a build adapter: it configures your project-level build nodes and target nodes via YAML, and customizes your build workflow via shell scripts. <br>
 **Anyone who can use the Unix command line can easily use this tool.**
 
