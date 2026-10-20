@@ -2,10 +2,10 @@
 
 [ [简体中文](README.md) | [English](README_EN.md) ]
 
-**Ferry is a lightweight automated deployment tool designed for customized build workflows at the individual and studio level.**
+**Ferry is a lightweight automated deployment tool designed for customized build workflows at the individual and studio level.** <br>
 It serves the following structure: `[dev machine] -> [build machine] -> [target deployment machine]`
 
-Ferry compresses the workflow of **“sync code → build → route artifacts → deploy”** into a single `ferry run`.
+Ferry compresses the workflow of **“sync code → build → route artifacts → deploy”** into a single `ferry run`. <br>
 After setting up SSH HostAlias, you can manage the entire deployment workflow through YAML and shell scripts.
 
 Ferry abstracts the whole workflow into the following three stages:
@@ -14,12 +14,12 @@ Ferry abstracts the whole workflow into the following three stages:
 2. Trigger user scripts by stage;
 3. Route artifacts and trigger automation scripts according to SSH reachability.
 
-One traditional approach is `Justfile + rsync + sshpass`; we simply design the whole workflow to be more user-friendly and **more friendly to heterogeneous and cross builds**.
-**Compared with CI solutions, the cost of deploying from scratch is also lower**, because **Ferry does not rely on storage servers or containerized runner nodes, and works better on platforms that only have busybox.**
+One traditional approach is `Justfile + rsync + sshpass`; we simply design the whole workflow to be more user-friendly and **more friendly to heterogeneous and cross builds**. <br>
+**Compared with CI solutions, the cost of deploying from scratch is also lower**, because **Ferry does not rely on storage servers or containerized runner nodes, and works better on platforms that only have busybox.** <br>
 Even if you use a **FreeRTOS-based platform with busybox** such as k230 or MaixCAN, you can use Ferry to customize the workflow, potentially bypassing an inefficient or unfriendly original build process to some extent.
 
-Ferry does not strongly depend on your existing Makefile/CMake/GNinja experience; it pursues **a universal and diverse compositional build workflow**.
-In other words, Ferry is more like a build adapter: it configures your project-level build nodes and target nodes via YAML, and customizes your build workflow via shell scripts.
+Ferry does not strongly depend on your existing Makefile/CMake/GNinja experience; it pursues **a universal and diverse compositional build workflow**. <br>
+In other words, Ferry is more like a build adapter: it configures your project-level build nodes and target nodes via YAML, and customizes your build workflow via shell scripts. <br>
 **Anyone who can use the Unix command line can easily use this tool.**
 
 In addition, because the probe is designed to be lightweight and as dependency-free as possible, the build machine can be a stateless VM node or an OCI container.
@@ -78,7 +78,7 @@ uv tool install ferry-tool
 ferry --version
 ```
 
-The release package bundles linux/amd64 and linux/arm64 probes; no Go is needed after installation.
+The release package bundles linux/amd64 and linux/arm64 probes; no Go is needed after installation. <br>
 The development side depends on Python and should run on multiple platforms.
 
 If you need Ferry for a special platform, building it yourself is very easy (depends on a Python environment and the uv manager):
@@ -101,7 +101,7 @@ uv run ferry --help
 
 ## SSH Authentication
 
-By default, automatic key configuration is performed and passwordless login is configured. *Note: the automatic password caching mechanism is theoretically visible to processes of the same user on the same machine.*
+By default, automatic key configuration is performed and passwordless login is configured. *Note: the automatic password caching mechanism is theoretically visible to processes of the same user on the same machine.* <br>
 You can also choose manual login (each SSH operation will interactively prompt for a password).
 
 ### Automatically configure key-based passwordless login (recommended)
