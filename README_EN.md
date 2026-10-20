@@ -57,6 +57,19 @@ Host buildvm
   ControlPersist 10m
 ```
 
+## Command Overview
+
+See details at [list.md](list.md)
+
+| Command                     | Do What                                                     | Affecting Who                                       |
+| :-------------------------- | ----------------------------------------------------------- | --------------------------------------------------- |
+| `ferry init`              | Init Project, Generate Config Templete                      | Dev                                                 |
+| `ferry up`                | Prepare for build, try connect nodes, install/prepare probe | ALL NODE                                            |
+| `ferry plan <target>`     | Preview, check if procedure valid                           | No body                                             |
+| `ferry run <target>`      | Sync Codes, build Codes, deploy results                    | ALL NODE                                            |
+| `ferry status [target]`   | Check the latest Status/log                                 | No Body                                             |
+| `ferry topology [target]` | Only Check Network reachability                            | ALL NODE `<br>`<br />（Just Network Interaction） |
+
 ## Installation
 
 ```bash

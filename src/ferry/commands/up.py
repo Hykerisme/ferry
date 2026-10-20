@@ -90,7 +90,7 @@ def up(
         False, "--yes", "-y", help="accept the generated config without prompting"
     ),
     reset: bool = typer.Option(
-        False, "--reset", help="re-upload the probe and reset host-key state"
+        False, "--reset", help="re-upload the probe binary to the build node"
     ),
     ask_pass: bool = typer.Option(
         False, "--ask-pass", help="prompt for SSH passwords and install Ferry keys"
