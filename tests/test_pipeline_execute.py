@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from ferry.config import (
     StageScripts,
     TargetCfg,
 )
+from ferry.executors import CommandResult
 from ferry.models import ExecEvent, ExecRequest, NodeInfo
 from ferry.pipeline import Pipeline, PipelineContext, PipelineError
 from ferry.state import load_state
@@ -53,16 +54,48 @@ class FakeProbe:
     def release_lock(self) -> None:
         self.lock_released = True
 
+    def get_stream(self, root: str, paths: list[str] | None = None):  # type: ignore[no-untyped-def]
+        yield b"fake-tar-bytes"
+
+
+class FakeProcess:
+    def __init__(self) -> None:
+        self.stdin = BytesIO()
+        self.stdout = BytesIO()
+        self.stderr = BytesIO()
+        self.written = b""
+        self.closed = False
+
+    def send(self, data: bytes) -> None:
+        self.written += data
+
+    def close_stdin(self) -> None:
+        self.closed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def terminate(self) -> None:
+        pass
+
 
 class FakeExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str], bytes | None]] = []
+        self.process = FakeProcess()
+
     def check(self, host: str) -> bool:
         return True
 
     def run(self, host, argv, stdin=None, timeout=None):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+        self.calls.append((host, argv, stdin))
+        command = " ".join(argv)
+        if "if [ -f" in command:
+            return CommandResult(0, b"Xrelay-ok\n", b"")
+        return CommandResult(0, b"", b"")
 
     def spawn(self, host, argv, stdin=None):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+        return self.process
 
 
 def make_context(tmp_path: Path) -> tuple[PipelineContext, FakeProbe]:
@@ -148,6 +181,39 @@ def test_execute_groups_stages_and_sets_lock(tmp_path: Path, monkeypatch) -> Non
     assert state.probe_pid is None
     assert state.lock_pid is None
     assert all(stage.state == "ok" for stage in state.stages.values())
+
+
+@requires_sh
+def test_via_dev_route_relays_target_work(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FERRY_HOME", str(tmp_path / "home"))
+    ctx, probe = make_context(tmp_path)
+    executor = FakeExecutor()
+    ctx.executor = executor
+    ctx.target_password = "secret"
+    ctx.route = Route(
+        name="build->dev->target",
+        description="relay",
+        uses_dev_relay=True,
+    )
+    pipeline = Pipeline(
+        ctx.loaded, "board", executor=executor, console=quiet_console()
+    )
+    steps = [step for step in pipeline.build_steps(via_dev=True) if step.kind != "sync"]
+    pipeline.execute(ctx, steps)
+
+    assert not any(
+        step.where == "target"
+        for request in probe.requests
+        for step in request.steps
+    )
+    target_calls = [call for call in executor.calls if call[0] == "board"]
+    assert len(target_calls) == 4
+    assert executor.process.written == b"fake-tar-bytes"
+    state = load_state("demo", "board")
+    assert state is not None
+    assert state.stages["pre_deploy"].state == "ok"
+    assert state.stages["deploy"].state == "ok"
+    assert state.stages["post_deploy"].state == "ok"
 
 
 @requires_sh

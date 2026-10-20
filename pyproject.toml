@@ -32,6 +32,7 @@ dependencies = [
 
 [project.scripts]
 ferry = "ferry.cli:app"
+ferry-askpass = "ferry.askpass:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

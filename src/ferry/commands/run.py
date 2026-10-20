@@ -3,6 +3,7 @@ from __future__ import annotations
 import typer
 from rich.console import Console
 
+from ..auth import resolve_credentials
 from ..config import ConfigError, load_config
 from ..executors import ExecError, SshExecutor
 from ..pipeline import Pipeline, PipelineError
@@ -19,6 +20,9 @@ def run(
         False, "--refresh-topology", help="ignore the topology cache"
     ),
     reset_probe: bool = typer.Option(False, "--reset-probe", help="re-upload the probe"),
+    ask_pass: bool = typer.Option(
+        False, "--ask-pass", help="prompt for SSH passwords (not stored)"
+    ),
 ) -> None:
     """Sync, build, route artifacts and deploy the selected target."""
     try:
@@ -38,8 +42,16 @@ def run(
         if not host:
             console.print("[red]state does not record the build node[/red]")
             raise typer.Exit(1)
+        credentials = resolve_credentials(ask=ask_pass, need_target=False)
+        executor = SshExecutor(
+            passwords=(
+                {host: credentials.build_password}
+                if credentials.build_password
+                else None
+            )
+        )
         pids = [pid for pid in (state.probe_pid, state.lock_pid) if pid]
-        cancel_remote(SshExecutor(), host, pids)
+        cancel_remote(executor, host, pids)
         console.print(
             f"sent SIGTERM to pids {pids} on {host}; "
             "the build will finish its grace period"
@@ -47,9 +59,12 @@ def run(
         return
 
     try:
-        pipeline = Pipeline(loaded, target, console=console)
+        credentials = resolve_credentials(ask=ask_pass)
+        pipeline = Pipeline(
+            loaded, target, console=console, credentials=credentials
+        )
         ctx = pipeline.prepare(refresh_topology=refresh_topology, reset_probe=reset_probe)
-        steps = pipeline.build_steps()
+        steps = pipeline.build_steps(via_dev=ctx.route.uses_dev_relay)
         pipeline.execute(ctx, steps)
     except (PipelineError, ProbeError, ExecError) as exc:
         console.print(f"[red]run failed:[/red] {exc}")

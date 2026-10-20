@@ -39,18 +39,31 @@ class Route:
 
 
 class RoutePolicy:
-    def decide(self, edges: Edges) -> Route:
+    def decide(self, edges: Edges, *, prefer_via_dev: bool = False) -> Route:
         if not edges.dev_build:
             raise TopologyError("dev cannot reach the build node over SSH")
+        if prefer_via_dev:
+            if edges.dev_target:
+                return Route(
+                    name="build->dev->target",
+                    description="artifacts are relayed through dev (password auth)",
+                    uses_dev_relay=True,
+                )
+            raise TopologyError("dev cannot reach the target node over SSH")
         if edges.build_target:
             return Route(
                 name="build->target",
                 description="artifacts are pushed directly from build to target",
             )
+        if edges.dev_target:
+            return Route(
+                name="build->dev->target",
+                description="build cannot reach target; artifacts are relayed through dev",
+                uses_dev_relay=True,
+            )
         raise TopologyError(
-            "build cannot reach target over SSH; the build->dev->target fallback "
-            "is planned for v2. Make the build node able to ssh to the target, "
-            "or verify the target alias in ~/.ssh/config."
+            "build cannot reach target and dev cannot reach target over SSH; "
+            "check the target alias in ~/.ssh/config"
         )
 
 
@@ -82,8 +95,17 @@ def _save_cache(project: str, target: str, edges: Edges) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def check_build_to_target(executor: Executor, build_node: str, target_node: str) -> bool:
-    argv = ["ssh", *SSH_CHECK_OPTIONS, target_node, "true"]
+def check_build_to_target(
+    executor: Executor,
+    build_node: str,
+    target_node: str,
+    *,
+    key: str | None = None,
+) -> bool:
+    opts = list(SSH_CHECK_OPTIONS)
+    if key:
+        opts.extend(["-i", key])
+    argv = ["ssh", *opts, target_node, "true"]
     try:
         result = executor.run(build_node, argv, timeout=15)
     except Exception:
@@ -100,15 +122,22 @@ def probe_edges(
     target: str,
     refresh: bool = False,
     ttl: int = CACHE_TTL_SECONDS,
+    skip_build_target: bool = False,
+    build_key: str | None = None,
 ) -> Edges:
-    if not refresh:
+    if not refresh and not skip_build_target:
         cached = _load_cache(project, target, ttl)
         if cached is not None:
             return cached
     dev_build = executor.check(build_node)
     dev_target = executor.check(target_node) if dev_build else False
-    build_target = check_build_to_target(executor, build_node, target_node) if dev_build else False
+    if skip_build_target or not dev_build:
+        build_target = False
+    else:
+        build_target = check_build_to_target(
+            executor, build_node, target_node, key=build_key
+        )
     edges = Edges(dev_build=dev_build, build_target=build_target, dev_target=dev_target)
-    if dev_build:
+    if dev_build and not skip_build_target:
         _save_cache(project, target, edges)
     return edges

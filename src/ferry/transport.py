@@ -3,6 +3,9 @@ from __future__ import annotations
 import fnmatch
 import shlex
 import tarfile
+import uuid
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO
 
@@ -125,13 +128,110 @@ def safe_extract(stream: IO[bytes], destination: Path) -> int:
     return count
 
 
-def artifact_push_command(out: str, target_host: str, deploy_path: str) -> str:
+def artifact_push_command(
+    out: str,
+    target_host: str,
+    deploy_path: str,
+    *,
+    key: str | None = None,
+) -> str:
     remote = (
         f"mkdir -p {shlex.quote(deploy_path)} && "
         f"tar -xf - -C {shlex.quote(deploy_path)}"
     )
-    ssh = (
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 "
-        f"-o StrictHostKeyChecking=accept-new {shlex.quote(target_host)} {shlex.quote(remote)}"
-    )
+    options = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if key:
+        options.extend(["-i", key])
+    ssh = "ssh " + " ".join(shlex.quote(item) for item in options)
+    ssh += f" {shlex.quote(target_host)} {shlex.quote(remote)}"
     return f"tar -C {shlex.quote(out)} -cf - . | {ssh}"
+
+
+def push_stream_to_target(
+    executor: Executor,
+    target_host: str,
+    deploy_path: str,
+    chunks: Iterable[bytes],
+) -> None:
+    remote = (
+        f"mkdir -p {shlex.quote(deploy_path)} && "
+        f"tar -xf - -C {shlex.quote(deploy_path)}"
+    )
+    process = executor.spawn(target_host, ["sh", "-c", remote])
+    if process.stdin is None:
+        raise ExecError("failed to open target ssh stdin")
+    try:
+        for chunk in chunks:
+            process.send(chunk)
+        process.close_stdin()
+    except (BrokenPipeError, OSError) as exc:
+        process.terminate()
+        raise ExecError(f"failed to push artifacts to {target_host}: {exc}") from exc
+    stderr = process.stderr.read() if process.stderr else b""
+    code = process.wait()
+    if code != 0:
+        raise ExecError(
+            f"artifact extraction failed on {target_host} ({code}): "
+            f"{stderr.decode('utf-8', 'replace').strip()}"
+        )
+
+
+@dataclass
+class RemoteScriptOutcome:
+    code: int
+    stdout: str
+    stderr: str
+    result: str | None
+
+
+def run_target_script(
+    executor: Executor,
+    host: str,
+    script: bytes,
+    cwd: str,
+    env: dict[str, str],
+    *,
+    timeout: float | None = None,
+) -> RemoteScriptOutcome:
+    script_path = f"/tmp/ferry-script-{uuid.uuid4().hex}.sh"
+    result_path = f"/tmp/ferry-result-{uuid.uuid4().hex}"
+    script_env = dict(env)
+    script_env["FERRY_RESULT_FILE"] = result_path
+    env_prefix = " ".join(
+        f"{key}={shlex.quote(value)}" for key, value in sorted(script_env.items())
+    )
+    remote = (
+        f"cat > {shlex.quote(script_path)} && chmod 700 {shlex.quote(script_path)} && "
+        f"mkdir -p {shlex.quote(cwd)} && cd {shlex.quote(cwd)} && "
+        f"{env_prefix} sh {shlex.quote(script_path)}; rc=$?; "
+        f"rm -f {shlex.quote(script_path)}; exit $rc"
+    )
+    completed = executor.run(host, ["sh", "-c", remote], stdin=script, timeout=timeout)
+
+    quoted_result = shlex.quote(result_path)
+    fetch = (
+        f"if [ -f {quoted_result} ]; then printf 'X'; cat {quoted_result}; "
+        f"rm -f {quoted_result}; else printf 'M'; fi"
+    )
+    fetched = executor.run(host, ["sh", "-c", fetch], timeout=15)
+    result: str | None = None
+    if fetched.returncode == 0 and fetched.stdout.startswith(b"X"):
+        payload = fetched.stdout[1:]
+        if not payload:
+            result = "(empty)"
+        else:
+            text = payload.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+            result = text[:512] + (" (truncated)" if len(text) > 512 else "")
+    return RemoteScriptOutcome(
+        code=completed.returncode,
+        stdout=completed.stdout_text,
+        stderr=completed.stderr_text,
+        result=result,
+    )

@@ -1,23 +1,14 @@
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol
-
-SSH_OPTS = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=3",
-]
 
 
 class ExecError(Exception):
@@ -124,21 +115,72 @@ class SshExecutor:
         *,
         accept_new_host_keys: bool = False,
         connect_timeout: int = 5,
+        passwords: dict[str, str] | None = None,
+        default_password: str | None = None,
+        identity: str | None = None,
     ) -> None:
         self.accept_new_host_keys = accept_new_host_keys
         self.connect_timeout = connect_timeout
+        self.passwords = dict(passwords or {})
+        self.default_password = default_password
+        self.identity = identity
 
-    def options(self) -> list[str]:
-        opts = list(SSH_OPTS)
-        opts[opts.index("ConnectTimeout=5")] = f"ConnectTimeout={self.connect_timeout}"
+    def password_for(self, host: str) -> str | None:
+        return self.passwords.get(host, self.default_password)
+
+    def options(self, host: str) -> list[str]:
+        opts = [
+            "-o",
+            f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
         policy = "accept-new" if self.accept_new_host_keys else "yes"
         opts.extend(["-o", f"StrictHostKeyChecking={policy}"])
+        if self.identity:
+            opts.extend(["-i", self.identity])
+        if self.password_for(host):
+            opts.extend(
+                [
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                    "-o",
+                    "PreferredAuthentications=password,keyboard-interactive",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                ]
+            )
+        else:
+            opts.extend(["-o", "BatchMode=yes"])
         return opts
+
+    def environment(self, host: str) -> dict[str, str] | None:
+        password = self.password_for(host)
+        if not password:
+            return None
+        program = shutil.which("ferry-askpass")
+        if program is None:
+            raise ExecError(
+                "password authentication requires the 'ferry-askpass' executable "
+                "on PATH (reinstall ferry-tool) or use SSH keys"
+            )
+        env = dict(os.environ)
+        env.update(
+            {
+                "SSH_ASKPASS": program,
+                "SSH_ASKPASS_REQUIRE": "force",
+                "DISPLAY": ":0",
+                "FERRY_ASKPASS_SECRET": password,
+            }
+        )
+        return env
 
     def _command(self, host: str, argv: list[str]) -> list[str]:
         if not argv:
             raise ExecError("empty remote command")
-        return ["ssh", *self.options(), host, shlex.join(argv)]
+        return ["ssh", *self.options(host), host, shlex.join(argv)]
 
     def check(self, host: str) -> bool:
         try:
@@ -160,6 +202,7 @@ class SshExecutor:
                 input=stdin,
                 capture_output=True,
                 timeout=timeout,
+                env=self.environment(host),
             )
         except subprocess.TimeoutExpired as exc:
             raise CommandTimeout(f"command on {host} timed out: {argv[0]}") from exc
@@ -180,6 +223,7 @@ class SshExecutor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=self.environment(host),
         )
         process = Process(popen, f"{argv[0]} on {host}")
         if stdin is not None:

@@ -32,6 +32,7 @@ type ExecRequest struct {
 	RunID      string      `json:"run_id"`
 	Workdir    string      `json:"workdir"`
 	TargetHost string      `json:"target_host"`
+	TargetKey  string      `json:"target_key"`
 	Lock       *LockSpec   `json:"lock"`
 	Marker     *MarkerSpec `json:"marker"`
 	CleanPaths []string    `json:"clean_paths"`

@@ -4,6 +4,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from ..auth import resolve_credentials
 from ..config import ConfigError, load_config
 from ..executors import ExecError, SshExecutor
 from ..topology import RoutePolicy, TopologyError, probe_edges
@@ -14,6 +15,9 @@ console = Console()
 def topology(
     target: str | None = typer.Argument(None, help="target alias (default: all targets)"),
     refresh: bool = typer.Option(False, "--refresh", help="ignore the topology cache"),
+    ask_pass: bool = typer.Option(
+        False, "--ask-pass", help="prompt for SSH passwords (not stored)"
+    ),
 ) -> None:
     """Probe SSH reachability for the three edges and print the routing decision."""
     try:
@@ -37,8 +41,16 @@ def topology(
     table.add_column("route")
 
     executor = SshExecutor()
+    credentials = resolve_credentials(ask=ask_pass)
     for name in names:
         cfg = targets[name]
+        passwords: dict[str, str] = {}
+        if credentials.build_password:
+            passwords[cfg.build.node] = credentials.build_password
+        if credentials.target_password:
+            passwords[cfg.deploy.node] = credentials.target_password
+        executor = SshExecutor(passwords=passwords)
+        prefer_via_dev = bool(credentials.target_password)
         try:
             edges = probe_edges(
                 executor,
@@ -47,9 +59,15 @@ def topology(
                 project=project,
                 target=name,
                 refresh=refresh,
+                skip_build_target=prefer_via_dev,
+                build_key=cfg.build.ssh_key,
             )
             try:
-                route = RoutePolicy().decide(edges).name
+                route = (
+                    RoutePolicy()
+                    .decide(edges, prefer_via_dev=prefer_via_dev)
+                    .name
+                )
             except TopologyError as exc:
                 route = f"error: {exc}"
         except ExecError as exc:

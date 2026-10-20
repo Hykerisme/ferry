@@ -10,3 +10,5 @@ build/
 .ferry/
 src/ferry/_probes/*/probe
 src/ferry/_probes/manifest.json
+probe/ferry-probe
+probe/ferry-probe.exe

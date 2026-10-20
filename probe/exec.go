@@ -200,14 +200,17 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 			)
 		}
 		wrapper := targetWrapper(step, cwd, remoteResultPath)
-		args := []string{
-			"ssh",
+		args := []string{"ssh"}
+		if req.TargetKey != "" {
+			args = append(args, "-i", req.TargetKey)
+		}
+		args = append(args,
 			"-o", "BatchMode=yes",
 			"-o", "ConnectTimeout=5",
 			"-o", "StrictHostKeyChecking=accept-new",
 			remoteHost,
 			wrapper,
-		}
+		)
 		cmd = exec.Command(args[0], args[1:]...)
 		cmd.Stdin = bytes.NewReader(content)
 	} else {
@@ -286,7 +289,7 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 	var result *Result
 	if step.Result {
 		if step.Where == "target" {
-			result = fetchRemoteResult(remoteHost, remoteResultPath)
+			result = fetchRemoteResult(remoteHost, remoteResultPath, req.TargetKey)
 		} else {
 			result = readLocalResult(localResultPath)
 		}
@@ -324,7 +327,7 @@ func readLocalResult(path string) *Result {
 	return parseResult(data, true)
 }
 
-func fetchRemoteResult(host, path string) *Result {
+func fetchRemoteResult(host, path, key string) *Result {
 	if host == "" || path == "" {
 		return &Result{State: "unset"}
 	}
@@ -333,14 +336,18 @@ func fetchRemoteResult(host, path string) *Result {
 		"if [ -f %s ]; then printf 'X'; cat %s; rm -f %s; else printf 'M'; fi",
 		quoted, quoted, quoted,
 	)
-	cmd := exec.Command(
-		"ssh",
+	args := []string{"ssh"}
+	if key != "" {
+		args = append(args, "-i", key)
+	}
+	args = append(args,
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=5",
 		"-o", "StrictHostKeyChecking=accept-new",
 		host,
 		remote,
 	)
+	cmd := exec.Command(args[0], args[1:]...)
 	out, err := cmd.Output()
 	if err != nil || len(out) == 0 {
 		return &Result{State: "unset"}

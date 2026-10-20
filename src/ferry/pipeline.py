@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from .auth import Credentials
 from .config import (
     LoadedConfig,
     ResolvedScript,
@@ -18,6 +19,7 @@ from .config import (
 )
 from .executors import Executor, SshExecutor
 from .models import ExecEvent, ExecRequest, ExecStep, MarkerSpec, NodeInfo
+from .paths import identity_path
 from .probe import ProbeError, RemoteProbe, ensure_remote_probe
 from .state import (
     RunState,
@@ -29,7 +31,13 @@ from .state import (
     save_state,
 )
 from .topology import Route, RoutePolicy, TopologyError, probe_edges
-from .transport import artifact_push_command, effective_ignores, upload_tree
+from .transport import (
+    artifact_push_command,
+    effective_ignores,
+    push_stream_to_target,
+    run_target_script,
+    upload_tree,
+)
 
 
 class PipelineError(Exception):
@@ -62,6 +70,7 @@ class PipelineContext:
     marker_path: str
     clean_paths: list[str]
     toolchain_version: str | None = None
+    target_password: str | None = None
 
     @property
     def project(self) -> str:
@@ -137,13 +146,24 @@ class Pipeline:
         *,
         executor: Executor | None = None,
         console: Console | None = None,
+        credentials: Credentials | None = None,
     ) -> None:
         self.loaded = loaded
         self.target_name = target_name
-        self.executor = executor or SshExecutor()
         self.console = console or Console()
         self.target = self._target(target_name)
         self.project = loaded.config.project.name or loaded.root.name
+        self.credentials = credentials or Credentials()
+        if executor is not None:
+            self.executor = executor
+        else:
+            passwords: dict[str, str] = {}
+            if self.credentials.build_password:
+                passwords[self.target.build.node] = self.credentials.build_password
+            if self.credentials.target_password:
+                passwords[self.target.deploy.node] = self.credentials.target_password
+            identity = str(identity_path()) if identity_path().is_file() else None
+            self.executor = SshExecutor(passwords=passwords, identity=identity)
 
     def _target(self, name: str) -> TargetCfg:
         try:
@@ -158,6 +178,7 @@ class Pipeline:
         self, *, refresh_topology: bool = False, reset_probe: bool = False
     ) -> PipelineContext:
         target = self.target
+        prefer_via_dev = bool(self.credentials.target_password)
         try:
             edges = probe_edges(
                 self.executor,
@@ -166,11 +187,13 @@ class Pipeline:
                 project=self.project,
                 target=self.target_name,
                 refresh=refresh_topology,
+                skip_build_target=prefer_via_dev,
+                build_key=target.build.ssh_key,
             )
         except Exception as exc:
             raise PipelineError(f"topology probing failed: {exc}") from exc
         try:
-            route = RoutePolicy().decide(edges)
+            route = RoutePolicy().decide(edges, prefer_via_dev=prefer_via_dev)
         except TopologyError as exc:
             raise PipelineError(str(exc)) from exc
 
@@ -201,6 +224,7 @@ class Pipeline:
             marker_path=f"{workdir}/.ferry/{self.target_name}.marker",
             clean_paths=[posix_join(workdir, item) for item in clean],
             toolchain_version=toolchain_version,
+            target_password=self.credentials.target_password,
         )
 
     def _check_toolchain(self, probe: RemoteProbe) -> str | None:
@@ -215,7 +239,7 @@ class Pipeline:
             toolchain.expect,
         )
 
-    def build_steps(self) -> list[PlannedStep]:
+    def build_steps(self, *, via_dev: bool = False) -> list[PlannedStep]:
         target = self.target
         steps: list[PlannedStep] = []
 
@@ -245,19 +269,35 @@ class Pipeline:
         )
         add_scripts("post_build")
         add_scripts("pre_deploy")
-        steps.append(
-            PlannedStep(
-                stage="deploy",
-                where="build",
-                kind="transfer",
-                description=f"push {target.out} to {target.deploy.node}:{target.deploy.path}",
-                command=artifact_push_command(
-                    posix_join(target.build.workdir, target.out),
-                    target.deploy.node,
-                    target.deploy.path,
-                ),
+        if via_dev:
+            steps.append(
+                PlannedStep(
+                    stage="deploy",
+                    where="dev",
+                    kind="deploy_via_dev",
+                    description=(
+                        f"pull {target.out} from build and push to "
+                        f"{target.deploy.node}:{target.deploy.path}"
+                    ),
+                )
             )
-        )
+        else:
+            steps.append(
+                PlannedStep(
+                    stage="deploy",
+                    where="build",
+                    kind="transfer",
+                    description=(
+                        f"push {target.out} to {target.deploy.node}:{target.deploy.path}"
+                    ),
+                    command=artifact_push_command(
+                        posix_join(target.build.workdir, target.out),
+                        target.deploy.node,
+                        target.deploy.path,
+                        key=target.build.ssh_key,
+                    ),
+                )
+            )
         add_scripts("post_deploy")
         return steps
 
@@ -355,6 +395,9 @@ class StepExecutor:
             if group[0].kind == "sync":
                 self._run_sync(group[0])
                 continue
+            if group[0].kind == "deploy_via_dev":
+                self._deploy_via_dev(group[0])
+                continue
             batch: list[PlannedStep] = []
             for step in group:
                 if step.where == "dev":
@@ -362,6 +405,11 @@ class StepExecutor:
                         self._run_remote(group_name, batch)
                         batch = []
                     self._run_local(step)
+                elif step.where == "target" and self.ctx.route.uses_dev_relay:
+                    if batch:
+                        self._run_remote(group_name, batch)
+                        batch = []
+                    self._run_target_via_dev(step)
                 else:
                     batch.append(step)
             if batch:
@@ -448,6 +496,7 @@ class StepExecutor:
             run_id=ctx.run_id,
             workdir=target.build.workdir,
             target_host=target.deploy.node,
+            target_key=target.build.ssh_key,
             steps=exec_steps,
         )
         if is_build_phase:
@@ -465,6 +514,57 @@ class StepExecutor:
             raise PipelineError(f"probe exited with code {self.end_code}")
         if len(executed) < len(steps):
             raise PipelineError("probe stopped before all steps completed")
+
+    def _run_target_via_dev(self, step: PlannedStep) -> None:
+        script = step.script
+        assert script is not None
+        path = self.pipeline.loaded.root / script.path
+        if not path.is_file():
+            raise PipelineError(f"script not found: {script.path}")
+        self._stage_started(step.stage)
+        target = self.ctx.target
+        self.log.line(f"[{step.stage}] target via dev: sh {script.path}")
+        outcome = run_target_script(
+            self.ctx.executor,
+            target.deploy.node,
+            path.read_bytes(),
+            target.deploy.path,
+            self.ctx.env,
+        )
+        for line in outcome.stdout.splitlines():
+            self.log.line(f"  {line}")
+        for line in outcome.stderr.splitlines():
+            self.log.line(f"  {line}")
+        if outcome.result:
+            self.log.line(f"[{step.stage}] result: {outcome.result}")
+        if outcome.code != 0:
+            self._mark(step.stage, "failed")
+            raise PipelineError(
+                f"step failed: {script.path} on target (exit code {outcome.code})"
+            )
+        self._mark(step.stage, "ok")
+        self.log.line(f"[{step.stage}] ok")
+
+    def _deploy_via_dev(self, step: PlannedStep) -> None:
+        target = self.ctx.target
+        self._stage_started("deploy")
+        self.log.line(
+            f"[deploy] relaying {self.ctx.remote_out} from build through dev "
+            f"-> {target.deploy.node}:{target.deploy.path}"
+        )
+        try:
+            chunks = self.ctx.probe.get_stream(self.ctx.remote_out)
+            push_stream_to_target(
+                self.ctx.executor,
+                target.deploy.node,
+                target.deploy.path,
+                chunks,
+            )
+        except Exception as exc:
+            self._mark("deploy", "failed")
+            raise PipelineError(f"artifact relay failed: {exc}") from exc
+        self._mark("deploy", "ok")
+        self.log.line("[deploy] ok")
 
     def _exec_step(self, step: PlannedStep) -> ExecStep:
         ctx = self.ctx

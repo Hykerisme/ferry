@@ -28,6 +28,11 @@ def cache_dir() -> Path:
     return ferry_home() / "cache"
 
 
+def identity_path() -> Path:
+    """Keypair managed by Ferry for password bootstrapping."""
+    return ferry_home() / "keys" / "id_ed25519"
+
+
 def ensure_home() -> None:
     for directory in (bin_dir(), state_dir(), logs_dir(), cache_dir()):
         directory.mkdir(parents=True, exist_ok=True)

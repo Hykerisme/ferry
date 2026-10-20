@@ -1,42 +1,28 @@
 # Ferry
 
-把「同步代码 → 构建 → 产物路由 → 部署」压缩成一次 `ferry run` 的构建-部署引导器。
+[ 简体中文 | English ]
 
-Ferry 不做构建、不管理工具链，只做三件事：
+**Ferry是一个轻量级的自动化部署工具，专为个人和工作室级的定制化构建流程。**
+服务于以下结构：`[开发机] -> [构建机] -> [目标部署机]`
 
-1. 把探针送到构建机；
+Ferry把**「同步代码 → 构建 → 产物路由 → 部署」**的流程压缩成一次 `ferry run` ，
+设置好SSH的HostAlias之后，通过Yaml和Shell脚本来管理整个部署流程。
+
+Ferry将整个流程抽象为以下三个阶段：
+
+1. 把探针和代码送到构建机（支持git管理和持久化）；
 2. 按阶段触发用户脚本；
-3. 按 SSH 可达性路由数据流。
+3. 按 SSH 可达性路由产物和触发自动化脚本。
 
-设计边界与决策见 [INSTRUCTION.md](INSTRUCTION.md)。
+传统的方案之一是 `Justfile + rsync + sshpass`，我们只是将整个流程设计的更人性化，并且**对异构和交叉构建更加友好**。
+**相比于CI方案，从零开始部署的成本也更低**，因为**Ferry并不依托于存储服务器或容器化Runner节点，针对只有busybox的平台也能更好工作。**
+就算你使用k230或MaixCAN之类的**基于带busybox的freertos平台，也可以使用Ferry来定制化流程**，可能一定程度上可以绕过低效或设计不友好的原构建流程。
 
-## 安装
+Ferry不强依赖于你已有的Makefile/CMake/GNinja经验，追求**通用化和多样化的组合式构建流程**。
+换言之，Ferry更像是一个构建适配器，通过Yaml配置化你的项目级构建节点和目标节点，通过Shell脚本来自定义你的构建流程。
+**任何会使用Unix命令行的人都可以轻松使用该工具**
 
-```bash
-uv tool install ferry-tool
-# 或：pipx install ferry-tool
-ferry --version
-```
-
-发布包已内置 linux/amd64 与 linux/arm64 探针，安装后无需 Go。
-
-也可以从源码开发：
-
-```bash
-git clone <repo> && cd ferry
-uv sync
-uv run ferry --help
-```
-
-## 前置条件
-
-- Python 3.10+（用 `uv tool` / `pipx` 安装时自动处理）
-- **从源码运行时**需要 Go 1.22+（用于交叉编译探针；发布 wheel 不需要）
-- 开发机可通过 SSH 免密访问构建机与目标机（推荐写进 `~/.ssh/config`）
-- 目标机至少提供 `ssh` + `sh` + `tar`
-- Windows 开发机上的 dev 阶段脚本需要 POSIX `sh`（Git for Windows 自带）
-
-> 开发机无需安装 rsync：dev→build 同步使用 Python `tarfile` 流 + ssh。
+此外，由于探针设计轻量且尽可能的无依赖，构建机可以是无状态的虚拟机节点或者OCI容器。
 
 ## 快速开始
 
@@ -44,6 +30,7 @@ uv run ferry --help
 ferry init
 
 # 引导：校验节点、推送探针、生成 .ferry.yaml
+# 我们以t507作为案例
 ferry up \
   --ssh buildvm \
   --target board \
@@ -54,7 +41,7 @@ ferry up \
   --out build/out \
   --yes
 
-ferry plan t507      # dry-run：先看完整步骤
+ferry plan t507      # dry-run：预览你的设置
 ferry run t507       # 同步 → 构建 → 部署
 ferry status
 ferry topology
@@ -69,6 +56,71 @@ Host buildvm
   ControlMaster auto
   ControlPersist 10m
 ```
+
+## 安装
+
+```bash
+uv tool install ferry-tool
+# 或：pipx install ferry-tool
+ferry --version
+```
+
+发布包已内置 linux/amd64 与 linux/arm64 探针，安装后无需 Go。
+开发端依赖于python，应该可以多平台运行。
+
+若需要特殊平台的Ferry，自行构建十分容易（依赖于python环境和uv管理器）：
+
+```bash
+git clone <repo> && cd ferry
+uv sync
+uv run ferry --help
+```
+
+## 构建前置条件
+
+- Python 3.10+（用 `uv tool` / `pipx` 安装时自动处理）
+- **（可选）从源码运行时**需要 Go 1.22+（用于交叉编译探针；发布 wheel 不需要）
+- 开发机可通过 SSH 访问构建机与目标机（密钥或密码方式均可）
+- 目标机至少提供 `ssh` + `sh` + `tar`
+- Windows 开发机上的 dev 阶段脚本需要 POSIX `sh`（Git for Windows 自带）
+
+> 目前开发机无需安装 rsync：dev→build 同步使用 Python `tarfile` 流 + ssh。
+
+## SSH 认证
+
+默认进行自动密钥配置并配置免密登录。*注意：自动密码缓存机制同机同用户进程理论上可见。*
+也可以选择手动登录（每次ssh操作都会交互式索要密码）
+
+### 自动配置密钥式的免密登录（推荐）
+
+```bash
+ferry up --ssh buildvm --target board --name t507 ... --ask-pass
+```
+
+输入两端密码后，Ferry 会：
+
+1. 在开发机生成 `~/.ferry/keys/id_ed25519`，安装到构建机和目标机；
+2. 在构建机生成 `~/.ferry/keys/id_ed25519`，把公钥安装到目标机（供 build→target 直连）；
+3. 验证三条边的密钥登录，成功后再继续引导。
+
+之后 `ferry run` 不再需要密码。目标机重新刷机后，重跑一次 `ferry up --ask-pass` 即可。
+
+### 每次运行手动密码登录
+
+```bash
+ferry run t507 --ask-pass
+```
+
+或用于 CI（不会落盘）：
+
+```bash
+export FERRY_BUILD_PASSWORD=...
+export FERRY_TARGET_PASSWORD=...
+# 两端同密码时可用 FERRY_SSH_PASSWORD
+ferry run t507
+```
+
+只提供目标机密码时，目标侧脚本和产物会走 `build -> dev -> target` 中转，**目标机密码不会下发到构建机**。~~代价是大产物会经过开发机带宽。~~
 
 ## 配置
 
@@ -100,12 +152,12 @@ targets:
 
 脚本条目的执行位置：
 
-| 写法 | 位置 |
-| --- | --- |
-| `scripts/x.sh`（pre_sync） | dev |
-| `scripts/x.sh`（post_sync / pre_build / post_build） | build |
-| `scripts/x.sh`（pre_deploy / post_deploy） | target |
-| `scripts/x.sh@dev` / `@build` / `@target` | 显式指定 |
+| 写法                                                   | 位置     |
+| ------------------------------------------------------ | -------- |
+| `scripts/x.sh`（pre_sync）                           | dev      |
+| `scripts/x.sh`（post_sync / pre_build / post_build） | build    |
+| `scripts/x.sh`（pre_deploy / post_deploy）           | target   |
+| `scripts/x.sh@dev` / `@build` / `@target`        | 显式指定 |
 
 脚本运行在项目根（target 侧为部署目录），环境变量显式注入：
 
@@ -121,16 +173,17 @@ XB_TARGET_HAS_SCP=1
 XB_BUILD_TOOLCHAIN_VER=v2.4.1
 ```
 
-脚本可以向 `$FERRY_RESULT_FILE` 写一行诊断摘要；Ferry 原样回传，不解析、不参与控制流。
+脚本可以向 `$FERRY_RESULT_FILE` 写一行诊断摘要；Ferry 原样回传。
 
-## 中断语义
+## 中断语义（如果你感兴趣的话）
 
 - 同一 target 的新 `run` 会在 sync 之前尝试获取构建锁，拿不到就拒绝；不会杀死正在运行的构建，也不会覆盖它正在使用的工作区。
-- `ferry run <target> --cancel` 发送 SIGTERM；探针把信号转发给构建进程组，等待 15 秒后才 SIGKILL。
-- 构建前写入 marker，正常结束（成功或普通失败）删除。异常中断会保留 marker；下次 `run` 检测到后清理构建目录并做一次全量，随后恢复增量。
-- 锁使用 `flock`，进程退出时由内核释放，不存在僵尸 PID 文件。
+  （不会自动杀死构建进程，避免构建流程中断）
+- `ferry run <target> --cancel` 发送 `SIGTERM`；探针把信号转发给构建进程组（比如docker和cmake会响应该信号并执行清理流程），等待 15 秒后才 `SIGKILL`。
+- 构建前写入 marker，正常结束（成功或普通失败）删除。异常中断会保留 marker；下次 `run` 检测到后清理构建目录来做一次全量，随后恢复增量。
+- 锁使用 `flock`，进程退出时由内核释放，避免僵尸 PID 文件。
 
-## 本机数据
+## 本机数据列表
 
 ```
 ~/.ferry/bin/      # 按 hash 缓存的探针二进制
@@ -139,16 +192,16 @@ XB_BUILD_TOOLCHAIN_VER=v2.4.1
 ~/.ferry/cache/    # 拓扑探测缓存（TTL 5 分钟）
 ```
 
-## 已知限制（MVP）
+## 已知限制
 
-- 拓扑固定为 `build -> target` 直连；`build -> dev -> target` 回退尚未实现。
 - 目标机必须提供 `tar`；无 tar 的降级链尚未实现。
 - tar 同步不会删除构建机上已从源码删除的文件。
+- 密码模式下目标侧操作经 dev 中转；需要直连时先用 `up --ask-pass` 安装密钥。
 - 不做工具链归档包分发、构建缓存、并发调度、回滚、常驻服务。
 
-## 发布
+## 获得发布Wheel
 
-发布名是 `ferry-tool`（PyPI 上 `ferry` 与 `ferry-cli` 已被占用），命令仍为 `ferry`。
+发布名是 `ferry-tool`，命令仍为 `ferry`。
 
 1. 修改 `pyproject.toml` 的版本号（探针版本从这里读取）。
 2. 提交并打 tag：`git tag v0.1.0 && git push origin v0.1.0`。
@@ -185,5 +238,3 @@ uv run python scripts/build_probe.py --bundle # 生成随 wheel 分发的探针
 bash scripts/wsl_probe_test.sh
 bash scripts/wsl_lock_test.sh
 ```
-
-人工验收清单见 `examples/t507-arm64/README.md`。

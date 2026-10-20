@@ -5,6 +5,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from ..auth import resolve_credentials
+from ..bootstrap import BootstrapError, bootstrap_keys
 from ..config import (
     CONFIG_FILENAME,
     BuildCfg,
@@ -21,6 +23,7 @@ from ..config import (
     load_config,
 )
 from ..executors import ExecError, SshExecutor, explain_ssh_failure
+from ..paths import identity_path
 from ..pipeline import PipelineError, check_toolchain_version
 from ..probe import ProbeError, ensure_remote_probe
 
@@ -89,6 +92,9 @@ def up(
     reset: bool = typer.Option(
         False, "--reset", help="re-upload the probe and reset host-key state"
     ),
+    ask_pass: bool = typer.Option(
+        False, "--ask-pass", help="prompt for SSH passwords and install Ferry keys"
+    ),
 ) -> None:
     """Bootstrap a build/target pair and write it to .ferry.yaml."""
     try:
@@ -143,7 +149,17 @@ def up(
         console.print("[red]workdir and deploy path must be absolute paths[/red]")
         raise typer.Exit(1)
 
-    executor = SshExecutor(accept_new_host_keys=True)
+    credentials = resolve_credentials(ask=ask_pass)
+    passwords: dict[str, str] = {}
+    if credentials.build_password:
+        passwords[build_node] = credentials.build_password
+    if credentials.target_password:
+        passwords[target_node] = credentials.target_password
+    identity = str(identity_path()) if identity_path().is_file() else None
+    executor = SshExecutor(
+        accept_new_host_keys=True, passwords=passwords, identity=identity
+    )
+    build_key = existing.build.ssh_key if existing else None
     try:
         console.print(f"checking {build_node} ...")
         _require_ssh(executor, build_node, "--ssh")
@@ -151,6 +167,27 @@ def up(
         console.print(f"checking {target_node} ...")
         _require_ssh(executor, target_node, "--target")
         _require_writable(executor, target_node, deploy_dir, "--deploy-path")
+
+        if credentials.has_any:
+            if credentials.build_password and credentials.target_password:
+                try:
+                    build_key = bootstrap_keys(
+                        executor, build_node, target_node, credentials
+                    )
+                    console.print(
+                        "[green]installed Ferry SSH keys[/green]; "
+                        "future runs use key authentication"
+                    )
+                    executor = SshExecutor(
+                        accept_new_host_keys=True, identity=str(identity_path())
+                    )
+                except BootstrapError as exc:
+                    console.print(f"[yellow]key bootstrap skipped:[/yellow] {exc}")
+            else:
+                console.print(
+                    "[yellow]supplying only one password; "
+                    "no key bootstrap performed[/yellow]"
+                )
 
         probe = ensure_remote_probe(executor, build_node, workdir, reset=reset)
         info = probe.info()
@@ -176,6 +213,7 @@ def up(
             node=build_node,
             workdir=workdir,
             clean=existing.build.clean if existing else None,
+            ssh_key=build_key,
         ),
         deploy=DeployCfg(node=target_node, path=deploy_dir),
         toolchain=ToolchainCfg(probe=probe_cmd, expect=expected_version),

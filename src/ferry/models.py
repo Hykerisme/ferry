@@ -59,6 +59,7 @@ class ExecRequest(BaseModel):
     run_id: str
     workdir: str
     target_host: str | None = None
+    target_key: str | None = None
     lock: LockSpec | None = None
     marker: MarkerSpec | None = None
     clean_paths: list[str] = []

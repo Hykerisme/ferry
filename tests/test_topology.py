@@ -39,11 +39,25 @@ def test_route_policy_prefers_direct_route() -> None:
     assert route.name == "build->target"
 
 
+def test_route_policy_falls_back_to_dev_relay() -> None:
+    route = RoutePolicy().decide(Edges(dev_build=True, build_target=False, dev_target=True))
+    assert route.name == "build->dev->target"
+    assert route.uses_dev_relay is True
+
+
+def test_route_policy_prefers_dev_relay_for_password_mode() -> None:
+    route = RoutePolicy().decide(
+        Edges(dev_build=True, build_target=True, dev_target=True),
+        prefer_via_dev=True,
+    )
+    assert route.name == "build->dev->target"
+
+
 def test_route_policy_rejects_missing_edges() -> None:
     with pytest.raises(TopologyError):
         RoutePolicy().decide(Edges(dev_build=False, build_target=True, dev_target=True))
     with pytest.raises(TopologyError):
-        RoutePolicy().decide(Edges(dev_build=True, build_target=False, dev_target=True))
+        RoutePolicy().decide(Edges(dev_build=True, build_target=False, dev_target=False))
 
 
 def test_topology_cache_ttl(tmp_path: Path, monkeypatch) -> None:

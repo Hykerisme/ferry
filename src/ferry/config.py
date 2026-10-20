@@ -81,6 +81,7 @@ class BuildCfg(StrictModel):
     node: str
     workdir: str
     clean: list[str] | None = None
+    ssh_key: str | None = None
 
     @field_validator("node")
     @classmethod
@@ -92,6 +93,13 @@ class BuildCfg(StrictModel):
     @field_validator("workdir")
     @classmethod
     def _workdir(cls, value: str) -> str:
+        return _validate_remote_path(value)
+
+    @field_validator("ssh_key")
+    @classmethod
+    def _ssh_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return _validate_remote_path(value)
 
     @field_validator("clean")
