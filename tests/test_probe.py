@@ -11,7 +11,10 @@ from ferry.probe import (
     ProbeError,
     bundled_probe,
     ensure_local_probe,
+    load_platforms,
     parse_version,
+    platform_by_id,
+    platform_for_machine,
     probe_source_dir,
     source_hash,
 )
@@ -57,56 +60,71 @@ def test_parse_version_rejects_garbage() -> None:
         parse_version("not json")
 
 
+def test_platform_matrix_maps_uname_machines() -> None:
+    assert platform_for_machine("x86_64") is not None
+    assert platform_for_machine("x86_64").id == "linux-amd64"  # type: ignore[union-attr]
+    assert platform_for_machine("aarch64") is not None
+    assert platform_for_machine("aarch64").id == "linux-arm64"  # type: ignore[union-attr]
+    assert platform_for_machine("armv7l") is not None
+    assert platform_for_machine("armv7l").id == "linux-armv7"  # type: ignore[union-attr]
+    assert platform_for_machine("mips") is None
+    assert platform_by_id("linux-amd64") is not None
+    bundled = [platform.id for platform in load_platforms() if platform.default_bundle]
+    assert "linux-amd64" in bundled
+    assert "linux-arm64" in bundled
+    assert "linux-armv7" in bundled
+
+
 def test_bundled_probe_reads_manifest(tmp_path: Path, monkeypatch) -> None:
     bundle = tmp_path / "_probes"
     (bundle / "linux-amd64").mkdir(parents=True)
-    (bundle / "linux-amd64" / "probe").write_bytes(b"binary")
+    (bundle / "linux-amd64" / "probe").write_bytes(b"binary abc123")
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
                 "version": PROBE_VERSION,
                 "hash": "abc123",
-                "architectures": {"amd64": "linux-amd64/probe"},
+                "platforms": {"linux-amd64": "linux-amd64/probe"},
             }
         ),
         encoding="utf-8",
     )
     monkeypatch.setattr("ferry.probe.bundled_probe_dir", lambda: bundle)
-    found = bundled_probe("amd64")
+    found = bundled_probe("linux-amd64")
     assert found is not None
-    assert found[0].read_bytes() == b"binary"
+    assert found[0].read_bytes() == b"binary abc123"
     assert found[1] == "abc123"
-    assert bundled_probe("arm64") is None
+    assert bundled_probe("linux-arm64") is None
 
 
 def test_bundled_probe_rejects_version_mismatch(tmp_path: Path, monkeypatch) -> None:
     bundle = tmp_path / "_probes"
     (bundle / "linux-amd64").mkdir(parents=True)
-    (bundle / "linux-amd64" / "probe").write_bytes(b"binary")
+    (bundle / "linux-amd64" / "probe").write_bytes(b"binary abc123")
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
                 "version": "0.0.0",
                 "hash": "abc123",
-                "architectures": {"amd64": "linux-amd64/probe"},
+                "platforms": {"linux-amd64": "linux-amd64/probe"},
             }
         ),
         encoding="utf-8",
     )
     monkeypatch.setattr("ferry.probe.bundled_probe_dir", lambda: bundle)
-    assert bundled_probe("amd64") is None
+    assert bundled_probe("linux-amd64") is None
 
 
 def test_ensure_local_probe_installs_bundle(tmp_path: Path, monkeypatch) -> None:
     bundle = tmp_path / "_probes"
     (bundle / "linux-amd64").mkdir(parents=True)
-    (bundle / "linux-amd64" / "probe").write_bytes(b"binary")
+    (bundle / "linux-amd64" / "probe").write_bytes(b"binary abc123")
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
                 "version": PROBE_VERSION,
                 "hash": "abc123",
-                "architectures": {"amd64": "linux-amd64/probe"},
+                "platforms": {"linux-amd64": "linux-amd64/probe"},
             }
         ),
         encoding="utf-8",
@@ -115,7 +133,42 @@ def test_ensure_local_probe_installs_bundle(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr("ferry.probe.bundled_probe_dir", lambda: bundle)
     monkeypatch.setattr("ferry.probe.probe_source_dir", lambda: tmp_path / "missing")
     monkeypatch.setattr("ferry.probe.bin_dir", lambda: cache)
-    path, digest = ensure_local_probe("amd64")
+    path, digest = ensure_local_probe("linux-amd64")
     assert digest == "abc123"
-    assert path.read_bytes() == b"binary"
+    assert path.read_bytes() == b"binary abc123"
     assert path == cache / "probe-linux-amd64-abc123"
+
+
+def test_stale_bundle_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    bundle = tmp_path / "_probes"
+    (bundle / "linux-amd64").mkdir(parents=True)
+    (bundle / "linux-amd64" / "probe").write_bytes(b"old binary")
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": PROBE_VERSION,
+                "hash": "abc123",
+                "platforms": {"linux-amd64": "linux-amd64/probe"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("ferry.probe.bundled_probe_dir", lambda: bundle)
+    monkeypatch.setattr("ferry.probe.probe_source_dir", lambda: tmp_path / "missing")
+    monkeypatch.setattr("ferry.probe.bin_dir", lambda: tmp_path / "bin")
+    with pytest.raises(ProbeError, match="stale probe binary"):
+        ensure_local_probe("linux-amd64")
+
+
+def test_real_bundle_manifest_matches_binaries() -> None:
+    from ferry.probe import bundled_probe_dir
+
+    manifest_path = bundled_probe_dir() / "manifest.json"
+    if not manifest_path.is_file():
+        pytest.skip("no bundled probes in this checkout")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    digest = str(manifest["hash"]).encode("ascii")
+    for platform_id, relative in manifest["platforms"].items():
+        binary = bundled_probe_dir() / relative
+        assert binary.is_file(), platform_id
+        assert digest in binary.read_bytes(), f"{platform_id} is stale"
