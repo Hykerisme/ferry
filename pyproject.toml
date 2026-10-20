@@ -1,0 +1,88 @@
+[project]
+name = "ferry-tool"
+version = "0.1.0"
+description = "Build-deploy orchestrator for toolchain-in-image, ephemeral-node workflows"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Hykerisme", email = "JerryTheHusky@outlook.com" }
+]
+keywords = ["build", "deploy", "ssh", "cross-compilation", "embedded"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.14.1",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+ferry = "ferry.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+artifacts = [
+    "src/ferry/_probes/*/probe",
+    "src/ferry/_probes/manifest.json",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ferry"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/probe",
+    "/scripts",
+    "/examples",
+    "/tests",
+    "/README.md",
+    "/INSTRUCTION.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "types-pyyaml>=6.0.12.20260906",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["yaml.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires real SSH nodes or a Linux host"]

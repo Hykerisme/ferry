@@ -1,0 +1,26 @@
+version: 1
+project:
+  name: t507-demo
+targets:
+  t507_arm64:
+    build:
+      node: buildvm
+      workdir: /work/t507-demo
+    deploy:
+      node: target-t507
+      path: /opt/app
+    toolchain:
+      probe: "cat /opt/toolchain/VERSION"
+      expect: "v2.4.1"
+    build_cmd: "cmake -B build -DCMAKE_TOOLCHAIN_FILE=toolchains/t507.cmake && cmake --build build -j"
+    out: build/out
+    stages:
+      post_sync:
+        - scripts/check-env.sh
+      post_build:
+        - scripts/strip-symbols.sh
+      pre_deploy:
+        - scripts/stop-service.sh
+      post_deploy:
+        - scripts/install-service.sh
+        - scripts/restart.sh
