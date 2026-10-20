@@ -18,6 +18,7 @@ from .config import (
     resolve_stage_scripts,
 )
 from .executors import Executor, SshExecutor
+from .facts import FactError, collect_target_info
 from .models import ExecEvent, ExecRequest, ExecStep, MarkerSpec, NodeInfo
 from .paths import identity_path
 from .probe import ProbeError, RemoteProbe, ensure_remote_probe
@@ -204,8 +205,27 @@ class Pipeline:
             reset=reset_probe,
         )
         info = probe.info()
+        try:
+            target_info = collect_target_info(
+                self.executor,
+                target,
+                probe,
+                dev_reachable=edges.dev_target,
+            )
+        except FactError as exc:
+            if not target.env:
+                raise PipelineError(str(exc)) from exc
+            self.console.print(f"[yellow]warning:[/yellow] {exc}")
+            target_info = NodeInfo()
         toolchain_version = self._check_toolchain(probe)
-        env = build_environment(self.project, self.target_name, info, toolchain_version)
+        env = build_environment(
+            self.project,
+            self.target_name,
+            info,
+            target_info,
+            toolchain_version,
+            target.env,
+        )
         run_id = new_run_id()
         workdir = target.build.workdir.rstrip("/")
         clean = target.build.clean or [first_component(target.out)]
@@ -215,7 +235,7 @@ class Pipeline:
             target=target,
             executor=self.executor,
             probe=probe,
-            info=info,
+            info=target_info,
             env=env,
             route=route,
             run_id=run_id,
@@ -717,23 +737,32 @@ def read_local_script_result(path: str) -> str | None:
 def build_environment(
     project: str,
     target_name: str,
-    info: NodeInfo,
+    build_info: NodeInfo,
+    target_info: NodeInfo,
     toolchain_version: str | None,
+    overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
     env = {
         "XB_PROJECT": project,
         "XB_TARGET": target_name,
-        "XB_TARGET_ARCH": info.arch,
-        "XB_TARGET_OS": info.distro or info.os,
-        "XB_TARGET_OS_VER": info.os_ver,
-        "XB_TARGET_INIT": info.init,
-        "XB_TARGET_GLIBC": info.glibc,
-        "XB_TARGET_HAS_RSYNC": "1" if info.has_rsync else "0",
-        "XB_TARGET_HAS_TAR": "1" if info.has_tar else "0",
-        "XB_TARGET_HAS_SCP": "1" if info.has_scp else "0",
+        "XB_BUILD_ARCH": build_info.arch,
+        "XB_BUILD_OS": build_info.distro or build_info.os,
+        "XB_BUILD_OS_VER": build_info.os_ver,
+        "XB_TARGET_ARCH": target_info.arch,
+        "XB_TARGET_OS": target_info.distro or target_info.os,
+        "XB_TARGET_OS_VER": target_info.os_ver,
+        "XB_TARGET_INIT": target_info.init,
+        "XB_TARGET_GLIBC": target_info.glibc,
+        "XB_TARGET_HAS_RSYNC": "1" if target_info.has_rsync else "0",
+        "XB_TARGET_HAS_TAR": "1" if target_info.has_tar else "0",
+        "XB_TARGET_HAS_SCP": "1" if target_info.has_scp else "0",
     }
     if toolchain_version:
         env["XB_BUILD_TOOLCHAIN_VER"] = toolchain_version
+    if overrides:
+        env.update(overrides)
+    env["XB_PROJECT"] = project
+    env["XB_TARGET"] = target_name
     return {key: value for key, value in env.items() if value}
 
 

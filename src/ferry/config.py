@@ -172,6 +172,7 @@ class TargetCfg(StrictModel):
     out: str = "dist"
     stages: StageScripts = Field(default_factory=StageScripts)
     sync: SyncCfg = Field(default_factory=SyncCfg)
+    env: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("build_cmd")
     @classmethod
@@ -184,6 +185,16 @@ class TargetCfg(StrictModel):
     @classmethod
     def _out(cls, value: str) -> str:
         return _validate_relative_path(value)
+
+    @field_validator("env")
+    @classmethod
+    def _env(cls, value: dict[str, str]) -> dict[str, str]:
+        for key, item in value.items():
+            if not key.strip():
+                raise ValueError("environment variable names must not be empty")
+            if not isinstance(item, str):
+                raise ValueError(f"environment variable {key!r} must be a string")
+        return value
 
 
 class ProjectCfg(StrictModel):

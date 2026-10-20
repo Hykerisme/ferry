@@ -129,6 +129,14 @@ def test_target_requires_build_cmd() -> None:
         )
 
 
+def test_target_env_overrides_are_loaded(tmp_path: Path) -> None:
+    target = dict(VALID["targets"]["board"])  # type: ignore[index]
+    target["env"] = {"XB_TARGET_INIT": "sysvinit", "MY_VAR": "value"}
+    write_config(tmp_path, {"targets": {"b": target}})
+    loaded = load_config(tmp_path)
+    assert loaded.config.targets["b"].env["XB_TARGET_INIT"] == "sysvinit"
+
+
 def test_config_dump_roundtrip(tmp_path: Path) -> None:
     from ferry.config import config_to_yaml
 

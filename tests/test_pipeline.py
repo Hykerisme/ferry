@@ -75,8 +75,15 @@ def test_unknown_target_is_reported(tmp_path: Path) -> None:
         Pipeline(loaded, "nope", console=Console(file=StringIO()))
 
 
-def test_build_environment_uses_probe_facts() -> None:
-    info = NodeInfo(
+def test_build_environment_uses_target_facts() -> None:
+    build_info = NodeInfo(
+        os="linux",
+        arch="amd64",
+        kernel="6.8",
+        distro="debian",
+        os_ver="12",
+    )
+    target_info = NodeInfo(
         os="linux",
         arch="arm64",
         kernel="5.10",
@@ -87,11 +94,20 @@ def test_build_environment_uses_probe_facts() -> None:
         has_tar=True,
         has_scp=True,
     )
-    env = build_environment("demo", "board", info, "v2.4.1")
+    env = build_environment(
+        "demo",
+        "board",
+        build_info,
+        target_info,
+        "v2.4.1",
+        {"XB_TARGET_INIT": "sysvinit"},
+    )
     assert env["XB_TARGET_ARCH"] == "arm64"
     assert env["XB_TARGET_OS"] == "ubuntu"
-    assert env["XB_TARGET_INIT"] == "systemd"
+    assert env["XB_TARGET_INIT"] == "sysvinit"
     assert env["XB_TARGET_HAS_RSYNC"] == "0"
+    assert env["XB_BUILD_ARCH"] == "amd64"
+    assert env["XB_BUILD_OS"] == "debian"
     assert env["XB_BUILD_TOOLCHAIN_VER"] == "v2.4.1"
     assert "XB_TARGET_GLIBC" in env
 
