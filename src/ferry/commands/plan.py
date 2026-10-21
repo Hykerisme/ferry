@@ -29,7 +29,7 @@ def plan(
             loaded, target, console=console, credentials=credentials
         )
         ctx = pipeline.prepare(refresh_topology=refresh_topology)
-        steps = pipeline.build_steps()
+        steps = pipeline.build_steps(ctx)
     except (ConfigError, PipelineError, ProbeError, ExecError) as exc:
         console.print(f"[red]plan failed:[/red] {exc}")
         raise typer.Exit(1) from exc

@@ -54,57 +54,80 @@ def topology(
     for name in names:
         cfg = targets[name]
         try:
-            resolved = resolve_target(cfg)
+            resolved = resolve_target(cfg, loaded.root)
         except NodeConfigMissing as exc:
             table.add_row(name, "-", "-", "-", f"error: {exc}")
             continue
         try:
-            dev_build = executor.check(resolved.build)
-            build_key = (
-                resolve_remote_ferry_key(executor, resolved.build)
-                if dev_build
-                else None
-            )
-            if resolved.deploy_role == "dev":
-                edges = Edges(dev_build=dev_build, build_target=False, dev_target=True)
-                route = "build->dev (local deploy)"
-            elif resolved.deploy_role == "build":
-                edges = Edges(dev_build=dev_build, build_target=False, dev_target=False)
-                route = "build->build (local deploy)"
-            else:
-                prefer_via_dev = (
-                    bool(credentials.target_password)
-                    or resolved.transfer_from == "dev"
-                )
-                edges = probe_edges(
-                    executor,
-                    resolved.build,
-                    resolved.deploy,
-                    project=project,
-                    target_name=name,
-                    refresh=refresh,
-                    skip_build_target=prefer_via_dev,
-                    build_key=build_key,
-                )
-                if resolved.transfer_from == "build" and not edges.build_target:
-                    route = "error: transfer_from=build.node but build cannot reach deploy"
-                elif resolved.transfer_from == "dev" and not edges.dev_target:
-                    route = "error: transfer_from=dev.node but dev cannot reach deploy"
+            if resolved.build_is_local:
+                if resolved.deploy_role == "dev":
+                    edges = Edges(
+                        dev_build=True, build_target=False, dev_target=True
+                    )
+                    route = "dev->dev (local build and deploy)"
                 else:
-                    try:
-                        route = (
-                            RoutePolicy()
-                            .decide(edges, prefer_via_dev=prefer_via_dev)
-                            .name
-                        )
-                    except TopologyError as exc:
-                        route = f"error: {exc}"
+                    dev_target = executor.check(resolved.deploy)
+                    edges = Edges(
+                        dev_build=True,
+                        build_target=False,
+                        dev_target=dev_target,
+                    )
+                    route = (
+                        "dev->target (local build)"
+                        if dev_target
+                        else "error: dev cannot reach deploy"
+                    )
+            else:
+                dev_build = executor.check(resolved.build)
+                build_key = (
+                    resolve_remote_ferry_key(executor, resolved.build)
+                    if dev_build
+                    else None
+                )
+                if resolved.deploy_role == "dev":
+                    edges = Edges(
+                        dev_build=dev_build, build_target=False, dev_target=True
+                    )
+                    route = "build->dev (local deploy)"
+                elif resolved.deploy_role == "build":
+                    edges = Edges(
+                        dev_build=dev_build, build_target=False, dev_target=False
+                    )
+                    route = "build->build (local deploy)"
+                else:
+                    prefer_via_dev = (
+                        bool(credentials.target_password)
+                        or resolved.transfer_from == "dev"
+                    )
+                    edges = probe_edges(
+                        executor,
+                        resolved.build,
+                        resolved.deploy,
+                        project=project,
+                        target_name=name,
+                        refresh=refresh,
+                        skip_build_target=prefer_via_dev,
+                        build_key=build_key,
+                    )
+                    if resolved.transfer_from == "build" and not edges.build_target:
+                        route = "error: transfer_from=build.node but build cannot reach deploy"
+                    elif resolved.transfer_from == "dev" and not edges.dev_target:
+                        route = "error: transfer_from=dev.node but dev cannot reach deploy"
+                    else:
+                        try:
+                            route = (
+                                RoutePolicy()
+                                .decide(edges, prefer_via_dev=prefer_via_dev)
+                                .name
+                            )
+                        except TopologyError as exc:
+                            route = f"error: {exc}"
         except ExecError as exc:
             edges = None
             route = f"error: {exc}"
         table.add_row(
             name,
-            _mark(edges.dev_build if edges else None),
+            "local" if resolved.build_is_local else _mark(edges.dev_build if edges else None),
             _mark(edges.build_target if edges else None),
             _mark(edges.dev_target if edges else None),
             route,

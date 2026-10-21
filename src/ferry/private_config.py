@@ -32,7 +32,7 @@ def dump_document(document: Any, path: Path) -> None:
 
 
 def regenerate_public(private_path: Path, public_path: Path) -> None:
-    """Regenerate .ferry.yaml from the private config, stripping node definitions."""
+    """Regenerate .ferry.yaml from the private config, stripping machine-specific nodes."""
     if not private_path.is_file():
         return
     document = load_document(private_path)
@@ -41,21 +41,22 @@ def regenerate_public(private_path: Path, public_path: Path) -> None:
     targets = document.get("targets") or {}
     for target in targets.values():
         build = target.get("build") or {}
-        build.pop("node", None)
+        if build.get("node") != "dev.node":
+            build.pop("node", None)
         deploy = target.get("deploy") or {}
-        deploy.pop("node", None)
-        deploy.pop("transfer_from", None)
+        if deploy.get("node") not in {"dev.node", "build.node"}:
+            deploy.pop("node", None)
     dump_document(document, public_path)
 
 
-def ensure_gitignore(root: Path) -> list[str]:
+def ensure_gitignore(root: Path, extra: tuple[str, ...] = ()) -> list[str]:
     path = root / ".gitignore"
     existing = []
     if path.is_file():
         existing = path.read_text(encoding="utf-8").splitlines()
     missing = [
         entry
-        for entry in (PRIVATE_CONFIG_FILENAME, ".env")
+        for entry in (PRIVATE_CONFIG_FILENAME, ".env", *extra)
         if entry not in existing
     ]
     if missing:
