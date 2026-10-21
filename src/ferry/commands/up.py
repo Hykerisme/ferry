@@ -275,7 +275,11 @@ def up(
     for warning in resolved.warnings:
         console.print(f"[yellow]warning:[/yellow] {warning}")
 
-    credentials = resolve_credentials(ask=ask_pass)
+    credentials = resolve_credentials(
+        ask=ask_pass,
+        need_build=not resolved.build_is_local,
+        need_target=resolved.deploy_role == "external",
+    )
     passwords: dict[str, str] = {}
     if credentials.build_password:
         passwords["build"] = credentials.build_password

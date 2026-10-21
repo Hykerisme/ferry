@@ -25,6 +25,7 @@ class Credentials:
 def resolve_credentials(
     *,
     ask: bool = False,
+    need_build: bool = True,
     need_target: bool = True,
     interactive: bool = True,
 ) -> Credentials:
@@ -37,7 +38,7 @@ def resolve_credentials(
     build_password = os.environ.get("FERRY_BUILD_PASSWORD") or shared
     target_password = os.environ.get("FERRY_TARGET_PASSWORD") or shared
     if ask and interactive:
-        if not build_password:
+        if need_build and not build_password:
             entered = getpass.getpass("Build node password (empty for key auth): ")
             build_password = entered or None
         if need_target and not target_password:
