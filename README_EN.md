@@ -2,10 +2,10 @@
 
 [ [简体中文](README.md) | [English](README_EN.md) ]
 
-**Ferry is a lightweight automated deployment tool designed for customized build workflows at the individual and studio level.** <br>
-It serves the following structure: `[dev machine] -> [build machine] -> [target deployment machine]`
+**Ferry is a lightweight automated deployment tool, designed for customized build workflows at the individual and studio level.** <br>
+It serves the following structure: `[dev node] -> [build node] -> [target deployment node]`
 
-Ferry compresses the workflow of **“sync code → build → route artifacts → deploy”** into a single `ferry run`. <br>
+Ferry compresses the workflow of **"sync code → build → artifact routing → deploy"** into a single `ferry run`. <br>
 After setting up SSH HostAlias, you can manage the entire deployment workflow through YAML and shell scripts.
 
 Ferry abstracts the whole workflow into the following three stages:
@@ -16,7 +16,7 @@ Ferry abstracts the whole workflow into the following three stages:
 
 One traditional approach is `Justfile + rsync + sshpass`; we simply design the whole workflow to be more user-friendly and **more friendly to heterogeneous and cross builds**. <br>
 **Compared with CI solutions, the cost of deploying from scratch is also lower**, because **Ferry does not rely on storage servers or containerized runner nodes, and works better on platforms that only have busybox.** <br>
-Even if you use a **FreeRTOS-based platform with busybox** such as k230 or MaixCAN, you can use Ferry to customize the workflow, potentially bypassing an inefficient or unfriendly original build process to some extent.
+Even if you use a **minimal busybox platform** such as k230 or MaixCAN, you can use Ferry to customize the workflow, potentially bypassing an inefficient or unfriendly original build process to some extent.
 
 Ferry does not strongly depend on your existing Makefile/CMake/GNinja experience; it pursues **a universal and diverse compositional build workflow**. <br>
 In other words, Ferry is more like a build adapter: it configures your project-level build nodes and target nodes via YAML, and customizes your build workflow via shell scripts. <br>
@@ -27,65 +27,133 @@ In addition, because the probe is designed to be lightweight and as dependency-f
 ## Quick Start
 
 ```bash
+# Initialize a ferry project
 ferry init
+# Or initialize a local standalone project
+# ferry init --local
 
-# Bootstrap: validate nodes, push the probe, generate .private.ferry.yaml and .ferry.yaml
-# We use t507 as an example
-ferry up \
-  --ssh buildvm \
-  --target board \
-  --name t507 \
-  --build-workdir /work/demo \
-  --deploy-workdir /opt/app \
-  --run-build "cmake -B build && cmake --build build -j" \
-  --run-deploy "echo deployed" \
-  --out ./build/out \
-  --yes
+## Enter .ferry.yaml to edit node configuration
 
 ferry plan t507      # dry-run: preview your settings
 ferry run t507       # sync → build → deploy
-ferry status
-ferry topology
+ferry status # View the last build status
+ferry topology # Quickly check reachability of the three points
 ```
 
-### Single-machine development (no SSH, no remote builder)
+## What is .ferry.yaml?
+**`.ferry.yaml` is the file Ferry uses to identify a Ferry project configuration.** <br>
+If you have used other CI tools or configuration-based container platforms, you should be familiar with such files.<br>
+In fact, during design we heavily referenced the CI/CD tool configurations of GitHub and GitLab, and abstracted the most core and easy-to-understand parts so that you can **get started quickly**.
 
-When the dev machine also acts as build and deploy, use `dev.node`:
+Using Ferry through such a file has two benefits:
+1. **Configuration as build**: If your project has multiple developers, `.ferry.yaml` can **maintain a similar build experience for each developer** and make the build workflow explicit.<br>
+For individual developers or studios with cloud build/heterogeneous build needs, you **do not need** to configure a complex distributed development platform or CI tool to **quickly formalize and standardize the workflow**.
+2. **Configuration as project**: We have **carefully designed** the configuration items of the file so that it can not only **quickly adapt to any project development experience** and **reduce onboarding time**,<br>
+but also serve as a *quick build workflow description* for your project, so that anyone new can start the build with one click without learning a platform-specific build method.
+3. **Configuration as preset**: Being small does not mean being simplistic. Small teams often face cross-platform development issues more frequently, and **we support accommodating multiple presets in one project**.<br>
+Maybe today you need to deploy to your own computer for testing, tomorrow to a Raspberry Pi, and the day after tomorrow to a Lichee Pi... **No problem, you can have many workflows.**
 
-```bash
-ferry init --local     # creates target: local, building and deploying locally
-# adjust run_build / out in .ferry.yaml
-ferry plan local
-ferry run local
+### I hate interactive configuration. Please tell me how to write .ferry.yaml.
+For the complete Chinese template, see [Chinese configuration file template](template_zh.ferry.yaml).
+<details>
+<summary>[Click to view] I really like YAML that can be written on one page. I wonder if you feel the same.</summary>
+
+```yaml
+version: 1
+targets:
+  give_it_a_nice_name:  # Target machine nickname, does not affect the build workflow
+    sync:
+      ignore:
+        - .git
+        - node_modules
+    # ---------------- Build node ----------------
+    build:
+      node: buildnode # (configure HostAlias in ~/.ssh/config)
+      # Inline HostAlias configuration is supported; see the template. Note that in inline mode, .ferry.yaml is not synced.
+      workdir: "/workspace" # << code will be sent here
+      out: "./build/out" # >> expected build artifact location (will be recursively copied to the deploy machine; use an array to filter what is transferred)
+
+      # Execution flow: before -> sync -> run -> after
+      before_build: "echo prepare to build" # optional
+      run_build: ["./scripts/build.sh"]
+      after_build: "echo build completed" # optional
+
+    # ---------------- Target node ----------------
+    deploy:
+      node: myboard
+      workdir: /opt/app
+
+      # Execution flow: before -> sync -> run -> after
+      before_deploy: "echo prepare to deploy" # optional
+      run_deploy: "echo deploying" # required
+      after_deploy: "echo deploy completed" # optional
 ```
 
-- `build.workdir: .` builds in place at the project root and skips sync.
-- Any other path (for example `./buildroot`) copies the workspace there first.
-- `deploy.workdir: ./deploy` is relative to the project root.
-- No SSH, probe, or remote Linux is needed; script steps require a POSIX `sh`.
+</details>
 
-`~/.ssh/config` example (remote nodes only):
+
+### I want fully local builds. Ferry doesn't seem suitable for me.
+**But wait! (in a dramatically translated tone)**
+Congratulations, Ferry also supports local builds.<br>
+In fact, Ferry's nodes are not limited to SSH targets. We provide two pronouns to express **node reuse**:
+- dev.node represents your dev machine node
+- build.node represents your build machine node
+
+In other words, you can absolutely do:<br>
+`dev.node -> dev.node -> dev.node` *(fully local build, and without going through OpenSSH)* <br>
+`dev.node -> build.node -> build.node` *(execute deploy scripts on the build machine; cloud build, cloud deploy (e.g., server-side deployment))* <br>
+`dev.node -> build.node -> dev.node` *(execute deploy scripts on the dev machine; cloud build, local deploy (e.g., flashing a microcontroller))* <br>
+... (and so on)
+
+<details>
+<summary>[Click to view] It's actually not much different from the above; just change all nodes to node: dev.node</summary>
+
+```yaml
+version: 1
+targets:
+  my_computer: # Does not affect the build workflow; assume we use this preset for local builds
+    sync:
+      ignore:
+        - .git
+        - node_modules
+    # ---------------- Build node ----------------
+    build:
+      node: dev.node # (configure HostAlias in ~/.ssh/config)
+      # Inline HostAlias configuration is supported; see the template. Note that in inline mode, .ferry.yaml is not synced.
+      workdir: "/workspace" # << code will be sent here
+      out: "./build/out" # >> expected build artifact location (will be recursively copied to the deploy machine; use an array to filter what is transferred)
+
+      # Execution flow: before -> sync -> run -> after
+      before_build: "echo prepare to build" # optional
+      run_build: ["./scripts/build.sh"]
+      after_build: "echo build completed" # optional
+
+    # ---------------- Target node ----------------
+    deploy:
+      node: dev.node
+      workdir: /tmp
+
+      # Execution flow: before -> sync -> run -> after
+      before_deploy: "echo prepare to deploy" # optional
+      run_deploy: "pretend you need a command to flash a physical device" # required
+      after_deploy: "echo deploy completed" # optional
 
 ```
-Host buildvm
-  HostName 192.168.1.10
-  User dev
-  ControlMaster auto
-  ControlPersist 10m
-```
+
+</details>
 
 ## Command Overview
 
-See details at [list.md](list.md)
+[list.md](list.md) has more detailed explanations.
 
-| Command                     | Do What                                                     | Affecting Who                                       |
-| :-------------------------- | ----------------------------------------------------------- | --------------------------------------------------- |
-| `ferry init`              | Init Project, generate a config template (`--local` for one machine) | Dev                                                 |
-| `ferry up`                | Prepare for build, try connect nodes, install/prepare probe | ALL NODE                                            |
-| `ferry plan <target>`     | Preview, check if procedure valid                           | No body                                             |
-| `ferry run <target>`      | Sync Codes, build Codes, deploy results                    | ALL NODE                                            |
-| `ferry status [target]`   | Check the latest Status/log                                 | No Body                                             |
-| `ferry topology [target]` | Only Check Network reachability                            | ALL NODE `<br>`<br />（Just Network Interaction） |
+| Command                     | Purpose                                                          | Node                                     |
+| :-------------------------- | ---------------------------------------------------------------- | ---------------------------------------- |
+| `ferry init`              | Initialize the project and generate a config template (`--local` generates a standalone target) | Dev machine                              |
+| `ferry up`                | Prepare for building: pre-connect nodes, install probes, etc.    | All nodes                                |
+| `ferry plan <target>`     | Workflow preview; check whether the configuration is correct     | None                                     |
+| `ferry run <target>`      | Perform code sync, build, and deploy.                            | All nodes                                |
+| `ferry status [target]`   | View the last build status                                       | None                                     |
+| `ferry topology [target]` | Perform network topology checks                                  | All nodes <br> <br /> (pure network requests) |
 
 ## Installation
 
@@ -95,7 +163,7 @@ uv tool install ferry-tool
 ferry --version
 ```
 
-The release package bundles linux/amd64, linux/arm64, and linux/armv7 probes; no Go is needed after installation. <br>
+The release package bundles linux/amd64, linux/arm64, and linux/armv7 probes. <br>
 The development side depends on Python and should run on multiple platforms.
 
 If you need Ferry for a special platform, building it yourself is very easy (depends on a Python environment and the uv manager):
@@ -106,20 +174,16 @@ uv sync
 uv run ferry --help
 ```
 
-## Build Prerequisites
+## Prerequisites for Building Ferry
 
 - Python 3.10+ (handled automatically when installing with `uv tool` / `pipx`)
 - **(Optional) Go 1.22+ is required when running from source** (for cross-compiling probes; not required for the released wheel)
-- The dev machine can access remote build/deploy nodes over SSH (key or password authentication)
-- The remote target machine must provide at least `ssh` + `sh` + `tar`
-- All stage scripts run on the build or deploy node; local build/deploy (`dev.node`) requires POSIX `sh` on the local machine (bundled with Git for Windows)
-
-> Currently, the dev machine does not need rsync: dev→build sync uses a Python `tarfile` stream + ssh; local mode copies files directly or builds in place.
+- Yes, that's it. (We want to make it as lightweight as possible.)
 
 ## SSH Authentication
 
-By default, automatic key configuration is performed and passwordless login is configured. *Note: the automatic password caching mechanism is theoretically visible to processes of the same user on the same machine.* <br>
-You can also choose manual login (you enter the password once per command and it is reused for that run).
+By default, automatic key configuration is performed and passwordless login is configured. *Note: the automatic password caching mechanism is theoretically visible to processes of the same user on the same machine.*
+You can also choose manual login (enter the password once per command run and reuse it within the same run).
 
 ### Automatically configure key-based passwordless login (recommended)
 
@@ -152,57 +216,19 @@ ferry run t507
 
 When only the target machine password is provided, target-side scripts and artifacts are relayed via `build -> dev -> target`, and **the target machine password is not sent down to the build machine**. ~~The cost is that large artifacts will pass through the dev machine's bandwidth.~~
 
-## Configuration
+## Security
+not decided yet
 
-`.ferry.yaml` is the committed public config; real node definitions live in `.private.ferry.yaml` (gitignored and never synced). After a successful run, Ferry regenerates `.ferry.yaml` from the private config, removing concrete aliases/inline nodes while keeping symbolic references such as `dev.node` / `build.node`, and preserving other content and comments. If `.env` exists at the project root, Ferry loads it and injects its variables into all stage commands/scripts.
-
-```yaml
-version: 1
-project:
-  name: demo
-targets:
-  t507:
-    sync:
-      ignore: [".git", ".ferry", ".private.ferry.yaml", ".env", ".venv", "__pycache__", "node_modules"]
-    build:
-      node: buildvm
-      workdir: /work/demo
-      out: ./build/out
-      before_build: [scripts/check-env.sh]
-      run_build: "cmake -B build && cmake --build build -j"
-      after_build: [scripts/strip-symbols.sh]
-    deploy:
-      node: board
-      transfer_from: build.node
-      workdir: /opt/app
-      before_deploy: [scripts/stop-service.sh]
-      run_deploy: "echo deployed"
-      after_deploy: [scripts/install-service.sh, scripts/restart.sh]
-```
-
-Rules:
-
-- A single string is a shell command; an array is a list of script paths executed in order.
-- `run_build` / `run_deploy` are required; `before_*` / `after_*` are optional.
-- Every command runs with `build.workdir` or `deploy.workdir` as cwd; each script runs on its own node.
-- `before_*` scripts are delivered separately before the bulk transfer, so environment checks fail early.
-- `out` is relative to `build.workdir`: a directory copies its contents recursively, a file copies the file, and an array merges each entry.
-- `node` accepts an SSH Host alias or an inline host alias; `build.node` also accepts `dev.node` (local build), and `deploy.node` also accepts `dev.node` / `build.node`.
-- Remote node `workdir` values must be absolute POSIX paths; `dev.node` accepts paths relative to the project root (`.` , `./buildroot`, `./deploy`).
-- A local `build.workdir` equal to the project root builds in place and skips sync; other paths copy the workspace locally first.
-- `transfer_from` is ignored with a warning for local builds; `deploy.node: build.node` becomes a local deploy when the build is local.
-- `.env` variables are injected into all stage scripts; `FERRY_*` is reserved and `FERRY_RESULT_FILE` is injected per script.
-- Scripts may write one line to `$FERRY_RESULT_FILE`; Ferry passes it back unchanged.
 
 ## Interruption Semantics (if you are interested)
 
-- A new `run` for the same target tries to acquire the build lock before sync and refuses if it cannot; it will not kill a running build or overwrite the workspace it is using.
+- A new `run` for the same target tries to acquire the build lock before sync and refuses if it cannot; it will not kill a running build or overwrite the workspace it is using. <br>
   (It will not automatically kill build processes, avoiding interruption of the build workflow.)
-- `ferry run <target> --cancel` requests a stop: remote builds receive `SIGTERM`, the probe forwards it to the build process group (for example, docker and cmake clean up), waits 15 seconds, then sends `SIGKILL`; local runs send `SIGINT` on POSIX and use `taskkill /T` on Windows.
-- A marker is written before `run_build` and deleted on normal completion (success or ordinary failure). Abnormal interruption keeps the marker; the next `run` cleans the first component of `out` and performs one full build. Interruptions during `before_build`/`sync` do not write a marker.
-- The lock uses `flock` (Windows uses `msvcrt.locking`) and is released by the kernel when the process exits, avoiding stale PID files.
+- `ferry run <target> --cancel` requests the build to stop: remote builds send `SIGTERM`, and the probe forwards the signal to the build process group (for example, docker and cmake will respond to the signal and perform cleanup), waits 15 seconds, and only then sends `SIGKILL`; local runs send `SIGINT` on POSIX and use `taskkill /T` on Windows.
+- A marker is written before `run_build` and deleted on normal completion (success or ordinary failure). Abnormal interruption keeps the marker; the next `run` detects it and cleans the first directory segment of `out` to perform a full build. Interruption during the `before_build`/`sync` stage does not write a marker.
+- The lock uses `flock` (`msvcrt.locking` on Windows) and is released by the kernel when the process exits, avoiding stale PID files.
 
-## Local Data List
+## Local Temporary Data List
 
 ```
 ~/.ferry/bin/      # Probe binaries cached by hash
@@ -214,50 +240,23 @@ Rules:
 
 ## Known Limitations
 
-- The target machine must provide `tar` + `sh`; the fallback chain for no tar has not been implemented yet (not needed for all-local targets).
-- tar sync and local copies do not delete files that have been deleted from the source.
-- When multiple `out` directories are merged, files with the same name are overwritten with a warning.
+- (Non-local mode only) The target machine must provide `tar` + `sh`;
+- In incremental transfer mode, deleted files are not automatically deleted on the remote machine;
+- [By design] (node reuse scenarios only) The tool does not prevent `out` directories from overlapping; it only issues a warning;
 - In password mode, target-side operations are relayed through dev; if a direct connection is needed, first install keys with `up --ask-pass`.
-- Ferry does not probe, check, or distribute toolchains; handle that in `before_build` / `run_build`.
-- Local-mode commands and scripts require POSIX `sh` on Windows (Git for Windows works).
-- No build caching, concurrent scheduling, rollback, or resident services.
+- [By design] No additional toolchains or features are provided; operations beyond transfer depend on user scripts.
 
-## Getting the Release Wheel
 
-The release name is `ferry-tool`, while the command remains `ferry`.
+## About Contributing to This Project
 
-1. Modify the version number in `pyproject.toml` (the probe version is read from here).
-2. Commit and tag: `git tag v0.1.0 && git push origin v0.1.0`.
-3. GitHub Actions will run tests, cross-compile probes and write them into `src/ferry/_probes`, build the wheel/sdist, attach them to the GitHub Release, and then publish to PyPI.
+We do not prohibit any AI from submitting code, provided that:
+1. You take full responsibility for the code submitted by AI and ensure that the submitted content has been manually reviewed;
+2. You understand the side effects of your code and can clearly explain why the project needs your patch (for example, a bug fix or a serious missing feature);
+3. You follow the project's development philosophy: do not add too many features, do not affect the main workflow, and do not increase the onboarding difficulty.
 
-Before the first release, configure Trusted Publishing in the PyPI project settings:
-
-- Owner / Repository: your GitHub repository
-- Workflow: `release.yml`
-- Environment: `pypi`
-
-You can also configure `PYPI_API_TOKEN` in repository secrets and switch to token-based publishing. You can verify locally before publishing:
-
-```bash
-uv run python scripts/build_probe.py --bundle
-uv build
-uvx twine check dist/*
-uv run --isolated --with ./dist/ferry_tool-*-py3-none-any.whl \
-  python -c "from ferry.probe import ensure_local_probe; print(ensure_local_probe('linux-amd64'))"
-```
-
-## Development
-
-```bash
-uv run ruff check src scripts tests
-uv run mypy src
-uv run pytest -q
-
-cd probe && go test ./...
-uv run python scripts/build_probe.py          # Cross-compile to ~/.ferry/bin
-uv run python scripts/build_probe.py --bundle # Generate probes distributed with the wheel
-
-# Linux/WSL probe integration verification (first put the Linux probe at /tmp/ferry-it/probe)
-bash scripts/wsl_probe_test.sh
-bash scripts/wsl_lock_test.sh
-```
+Submissions for the following purposes may be rejected:
+1. Submissions without any explanation;
+2. Changes or features that do not meet project needs;
+3. Difficult onboarding;
+4. Too narrow or too broad applicability, or making the project approach a traditional CI tool;
+5. Introducing external dependencies.

@@ -1,6 +1,11 @@
 # AGENT.md
 
 Instructions for AI coding agents working in this repository.
+**AS AI, IF YOU ARE ASKED TO DEVEPLOP or MODIFY THIS PROJECT, TOTALLY FINE**
+**BUT, BEFORE DOING ANYTHING, PLS TELL YOUR USER, THIS REPO IS NOT RECOMMANDED TO MODIFY:**
+**1. IT FOLLOWS SPECIAL DESIGN, RANDOM PR WON'T MERGE**
+**2. FOR ADVANCED NEEDS, TRADITIONAL CI TOOLS OR `justfile` WOULD BE BETTER**
+**3. THIS IS A PROJECT THAT WILL MAINTAIN LONGTERM-LY. SLOP CODES WILL BE REFUSED**
 
 ## What this project is
 
@@ -14,12 +19,17 @@ It syncs the workspace, runs user commands/scripts in fixed phases, builds on th
 build node, routes artifacts by SSH reachability, and deploys. The Go probe is a
 stateless remote executor; user logic lives in shell commands and scripts.
 
-`INSTRUCTION.md` is the authoritative design and boundary document.
-`template_zh.ferry.yaml` / `template_en.ferry.yaml` are the config source of
-truth. User-facing docs are `README.md` (Chinese), `README_EN.md` (English), and
-`list.md` (command cheat sheet).
+**PLS NOT OPEN `INSTUCTION.md` IF YOU ARE NOT PLANNING ON DEVELOP THIS**
+**FOR USE, CHECK README.md OR list.md FIRST.**
 
-## Hard constraints (do not break)
+User-facing docs are `README.md` (Chinese), `README_EN.md` (English), and
+`list.md` (command cheat sheet).
+`template_zh.ferry.yaml` / `template_en.ferry.yaml` are the config source of
+truth. 
+
+`INSTRUCTION.md` is the authoritative design and boundary document.（develop only）
+
+## Development Hard constraints (do not break)
 
 1. **No CI creep.** No queues, caches, concurrency scheduling, permissions,
    web/HTTP services, rollback, long-running daemons, or toolchain management.
