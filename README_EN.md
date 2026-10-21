@@ -29,16 +29,17 @@ In addition, because the probe is designed to be lightweight and as dependency-f
 ```bash
 ferry init
 
-# Bootstrap: validate nodes, push the probe, generate .ferry.yaml
+# Bootstrap: validate nodes, push the probe, generate .private.ferry.yaml and .ferry.yaml
 # We use t507 as an example
 ferry up \
   --ssh buildvm \
   --target board \
   --name t507 \
   --build-workdir /work/demo \
-  --deploy-path /opt/app \
-  --build-cmd "cmake -B build && cmake --build build -j" \
-  --out build/out \
+  --deploy-workdir /opt/app \
+  --run-build "cmake -B build && cmake --build build -j" \
+  --run-deploy "echo deployed" \
+  --out ./build/out \
   --yes
 
 ferry plan t507      # dry-run: preview your settings
@@ -78,7 +79,7 @@ uv tool install ferry-tool
 ferry --version
 ```
 
-The release package bundles linux/amd64 and linux/arm64 probes; no Go is needed after installation. <br>
+The release package bundles linux/amd64, linux/arm64, and linux/armv7 probes; no Go is needed after installation. <br>
 The development side depends on Python and should run on multiple platforms.
 
 If you need Ferry for a special platform, building it yourself is very easy (depends on a Python environment and the uv manager):
@@ -95,14 +96,14 @@ uv run ferry --help
 - **(Optional) Go 1.22+ is required when running from source** (for cross-compiling probes; not required for the released wheel)
 - The dev machine can access the build machine and target machine over SSH (key or password authentication)
 - The target machine must provide at least `ssh` + `sh` + `tar`
-- dev-stage scripts on a Windows dev machine require POSIX `sh` (bundled with Git for Windows)
+- All stage scripts run on the build or deploy node; `deploy.node: dev.node` requires POSIX `sh` on the local machine (bundled with Git for Windows)
 
 > Currently, the dev machine does not need rsync: dev→build sync uses a Python `tarfile` stream + ssh.
 
 ## SSH Authentication
 
 By default, automatic key configuration is performed and passwordless login is configured. *Note: the automatic password caching mechanism is theoretically visible to processes of the same user on the same machine.* <br>
-You can also choose manual login (each SSH operation will interactively prompt for a password).
+You can also choose manual login (you enter the password once per command and it is reused for that run).
 
 ### Automatically configure key-based passwordless login (recommended)
 
@@ -137,7 +138,7 @@ When only the target machine password is provided, target-side scripts and artif
 
 ## Configuration
 
-`.ferry.yaml` and `scripts/` go into git with the project. Minimal example:
+`.ferry.yaml` is the committed public config; real node definitions live in `.private.ferry.yaml` (gitignored and never synced). After a successful run, Ferry regenerates `.ferry.yaml` from the private config with node definitions removed, preserving other content and comments. If `.env` exists at the project root, Ferry loads it and injects its variables into all stage commands/scripts.
 
 ```yaml
 version: 1
@@ -145,61 +146,48 @@ project:
   name: demo
 targets:
   t507:
+    sync:
+      ignore: [".git", ".ferry", ".private.ferry.yaml", ".env", ".venv", "__pycache__", "node_modules"]
     build:
       node: buildvm
       workdir: /work/demo
+      out: ./build/out
+      before_build: [scripts/check-env.sh]
+      run_build: "cmake -B build && cmake --build build -j"
+      after_build: [scripts/strip-symbols.sh]
     deploy:
       node: board
-      path: /opt/app
-    toolchain:
-      probe: "cat /opt/toolchain/VERSION"
-      expect: "v2.4.1"
-    build_cmd: "cmake -B build && cmake --build build -j"
-    out: build/out
-    stages:
-      post_sync: [scripts/check-env.sh]
-      post_build: [scripts/strip-symbols.sh]
-      pre_deploy: [scripts/stop-service.sh]
-      post_deploy: [scripts/install-service.sh, scripts/restart.sh]
+      transfer_from: build.node
+      workdir: /opt/app
+      before_deploy: [scripts/stop-service.sh]
+      run_deploy: "echo deployed"
+      after_deploy: [scripts/install-service.sh, scripts/restart.sh]
 ```
 
-Execution location of script entries:
+Rules:
 
-| Entry                                                 | Location             |
-| ----------------------------------------------------- | -------------------- |
-| `scripts/x.sh` (pre_sync)                           | dev                  |
-| `scripts/x.sh` (post_sync / pre_build / post_build) | build                |
-| `scripts/x.sh` (pre_deploy / post_deploy)           | target               |
-| `scripts/x.sh@dev` / `@build` / `@target`       | Explicitly specified |
-
-Scripts run at the project root (on the target side, the deployment directory). Environment variables are explicitly injected:
-
-```
-XB_TARGET_ARCH=arm64
-XB_TARGET_OS=ubuntu
-XB_TARGET_OS_VER=18.04
-XB_TARGET_INIT=systemd
-XB_TARGET_GLIBC=2.27
-XB_TARGET_HAS_RSYNC=0
-XB_TARGET_HAS_TAR=1
-XB_TARGET_HAS_SCP=1
-XB_BUILD_TOOLCHAIN_VER=v2.4.1
-```
-
-Scripts can write a one-line diagnostic summary to `$FERRY_RESULT_FILE`; Ferry passes it back unchanged.
+- A single string is a shell command; an array is a list of script paths executed in order.
+- `run_build` / `run_deploy` are required; `before_*` / `after_*` are optional.
+- Every command runs with `build.workdir` or `deploy.workdir` as cwd; each script runs on its own node.
+- `before_*` scripts are delivered separately before the bulk transfer, so environment checks fail early.
+- `out` is relative to `build.workdir`: a directory copies its contents recursively, a file copies the file, and an array merges each entry.
+- `node` accepts an SSH Host alias or an inline host alias; `deploy.node` also accepts `dev.node` / `build.node`.
+- `.env` variables are injected into all stage scripts; `FERRY_*` is reserved and `FERRY_RESULT_FILE` is injected per script.
+- Scripts may write one line to `$FERRY_RESULT_FILE`; Ferry passes it back unchanged.
 
 ## Interruption Semantics (if you are interested)
 
 - A new `run` for the same target tries to acquire the build lock before sync and refuses if it cannot; it will not kill a running build or overwrite the workspace it is using.
   (It will not automatically kill build processes, avoiding interruption of the build workflow.)
 - `ferry run <target> --cancel` sends `SIGTERM`; the probe forwards the signal to the build process group (for example, docker and cmake will respond to the signal and perform cleanup), waits 15 seconds, and only then sends `SIGKILL`.
-- A marker is written before the build and deleted on normal completion (success or ordinary failure). Abnormal interruption keeps the marker; the next `run` detects it and cleans the build directory to perform a full build, then resumes incremental builds.
+- A marker is written before `run_build` and deleted on normal completion (success or ordinary failure). Abnormal interruption keeps the marker; the next `run` cleans the first component of `out` and performs one full build. Interruptions during `before_build`/`sync` do not write a marker.
 - The lock uses `flock` and is released by the kernel when the process exits, avoiding stale PID files.
 
 ## Local Data List
 
 ```
 ~/.ferry/bin/      # Probe binaries cached by hash
+~/.ferry/keys/     # Keys managed by Ferry
 ~/.ferry/state/    # Last run status for each project/target
 ~/.ferry/logs/     # Run logs
 ~/.ferry/cache/    # Topology probe cache (TTL 5 minutes)
@@ -207,10 +195,12 @@ Scripts can write a one-line diagnostic summary to `$FERRY_RESULT_FILE`; Ferry p
 
 ## Known Limitations
 
-- The target machine must provide `tar`; the fallback chain for no tar has not been implemented yet.
+- The target machine must provide `tar` + `sh`; the fallback chain for no tar has not been implemented yet.
 - tar sync does not delete files on the build machine that have been deleted from the source.
+- When multiple `out` directories are merged, files with the same name are overwritten with a warning.
 - In password mode, target-side operations are relayed through dev; if a direct connection is needed, first install keys with `up --ask-pass`.
-- No toolchain archive distribution, build caching, concurrent scheduling, rollback, or resident services.
+- Ferry does not probe, check, or distribute toolchains; handle that in `before_build` / `run_build`.
+- No build caching, concurrent scheduling, rollback, or resident services.
 
 ## Getting the Release Wheel
 
@@ -233,7 +223,7 @@ uv run python scripts/build_probe.py --bundle
 uv build
 uvx twine check dist/*
 uv run --isolated --with ./dist/ferry_tool-*-py3-none-any.whl \
-  python -c "from ferry.probe import ensure_local_probe; print(ensure_local_probe('amd64'))"
+  python -c "from ferry.probe import ensure_local_probe; print(ensure_local_probe('linux-amd64'))"
 ```
 
 ## Development

@@ -1,0 +1,48 @@
+{
+  "platforms": [
+    {
+      "id": "linux-amd64",
+      "goos": "linux",
+      "goarch": "amd64",
+      "machines": ["x86_64", "amd64"],
+      "default_bundle": true
+    },
+    {
+      "id": "linux-arm64",
+      "goos": "linux",
+      "goarch": "arm64",
+      "machines": ["aarch64", "arm64"],
+      "default_bundle": true
+    },
+    {
+      "id": "linux-armv7",
+      "goos": "linux",
+      "goarch": "arm",
+      "goarm": "7",
+      "machines": ["armv7l", "armv7", "armv8l", "arm"],
+      "default_bundle": true
+    },
+    {
+      "id": "linux-armv6",
+      "goos": "linux",
+      "goarch": "arm",
+      "goarm": "6",
+      "machines": ["armv6l", "armv6"],
+      "default_bundle": false
+    },
+    {
+      "id": "linux-386",
+      "goos": "linux",
+      "goarch": "386",
+      "machines": ["i386", "i486", "i586", "i686"],
+      "default_bundle": false
+    },
+    {
+      "id": "linux-riscv64",
+      "goos": "linux",
+      "goarch": "riscv64",
+      "machines": ["riscv64"],
+      "default_bundle": false
+    }
+  ]
+}

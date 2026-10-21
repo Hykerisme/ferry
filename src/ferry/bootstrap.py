@@ -3,7 +3,8 @@ from __future__ import annotations
 import subprocess
 
 from .auth import Credentials
-from .executors import Executor, SshExecutor
+from .executors import Executor, Host, SshExecutor
+from .nodes import NodeSpec
 from .paths import identity_path
 
 
@@ -48,7 +49,7 @@ def ensure_local_key() -> str:
         raise BootstrapError(f"cannot read {public}: {exc}") from exc
 
 
-def install_public_key(executor: Executor, host: str, public_key: str) -> None:
+def install_public_key(executor: Executor, host: Host, public_key: str) -> None:
     command = (
         'key=$(cat); mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" && '
         'touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys" && '
@@ -60,17 +61,17 @@ def install_public_key(executor: Executor, host: str, public_key: str) -> None:
     )
     if result.returncode != 0:
         raise BootstrapError(
-            f"failed to install the public key on {host}: "
+            f"failed to install the public key on {_display(host)}: "
             f"{result.stderr_text.strip() or f'exit {result.returncode}'}"
         )
 
 
-def ensure_build_key(executor: Executor, host: str) -> tuple[str, str]:
+def ensure_build_key(executor: Executor, host: Host) -> tuple[str, str]:
     home_result = executor.run(host, ["sh", "-c", 'printf %s "$HOME"'], timeout=15)
     home = home_result.stdout_text.strip()
     if home_result.returncode != 0 or not home:
         raise BootstrapError(
-            f"cannot determine HOME on {host}: {home_result.stderr_text.strip()}"
+            f"cannot determine HOME on {_display(host)}: {home_result.stderr_text.strip()}"
         )
     command = (
         'mkdir -p "$HOME/.ferry/keys" && chmod 700 "$HOME/.ferry/keys" && '
@@ -81,19 +82,19 @@ def ensure_build_key(executor: Executor, host: str) -> tuple[str, str]:
     result = executor.run(host, ["sh", "-c", command], timeout=60)
     if result.returncode != 0:
         raise BootstrapError(
-            f"failed to prepare the build key on {host}: "
+            f"failed to prepare the build key on {_display(host)}: "
             f"{result.stderr_text.strip() or 'ssh-keygen is required'}"
         )
     lines = [line.strip() for line in result.stdout_text.splitlines() if line.strip()]
     if not lines:
-        raise BootstrapError(f"build key on {host} produced no public key")
+        raise BootstrapError(f"build key on {_display(host)} produced no public key")
     return f"{home.rstrip('/')}/.ferry/keys/id_ed25519", lines[-1]
 
 
 def bootstrap_keys(
     executor: Executor,
-    build_node: str,
-    target_node: str,
+    build_node: NodeSpec,
+    target_node: NodeSpec,
     credentials: Credentials,
 ) -> str:
     """Install keys so that future runs need no passwords. Returns the build key path."""
@@ -110,22 +111,23 @@ def bootstrap_keys(
 
     key_executor = SshExecutor(identity=str(identity_path()))
     if not key_executor.check(build_node):
-        raise BootstrapError(f"key authentication still fails for {build_node}")
+        raise BootstrapError(f"key authentication still fails for {build_node.display()}")
     if not key_executor.check(target_node):
-        raise BootstrapError(f"key authentication still fails for {target_node}")
+        raise BootstrapError(f"key authentication still fails for {target_node.display()}")
     result = key_executor.run(
         build_node,
         [
             "ssh",
             "-i",
             build_key,
+            *target_node.ssh_options(),
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=5",
             "-o",
             "StrictHostKeyChecking=accept-new",
-            target_node,
+            target_node.destination,
             "true",
         ],
         timeout=20,
@@ -136,3 +138,7 @@ def bootstrap_keys(
             f"{result.stderr_text.strip()}"
         )
     return build_key
+
+
+def _display(host: Host) -> str:
+    return host.display() if isinstance(host, NodeSpec) else str(host)

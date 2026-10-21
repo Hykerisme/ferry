@@ -5,7 +5,13 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from ..config import CONFIG_FILENAME, config_to_yaml, diff_config, initial_config
+from ..config import (
+    CONFIG_FILENAME,
+    config_to_yaml,
+    diff_config,
+    initial_config,
+)
+from ..private_config import ensure_gitignore
 
 console = Console()
 
@@ -38,5 +44,8 @@ def init(
         if diff:
             console.print(diff, markup=False, highlight=False)
     path.write_text(new_text, encoding="utf-8")
+    added = ensure_gitignore(root)
+    if added:
+        console.print(f"added to .gitignore: {', '.join(added)}")
     console.print(f"created {path}")
-    console.print("next: run 'ferry up --ssh <build-node> --target <target-node>'")
+    console.print("next: run 'ferry up' to define the build and deploy nodes")

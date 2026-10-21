@@ -1,57 +1,37 @@
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import Where
-
 CONFIG_FILENAME = ".ferry.yaml"
-
-STAGE_ORDER = (
-    "pre_sync",
-    "sync",
-    "post_sync",
-    "pre_build",
-    "build",
-    "post_build",
-    "pre_deploy",
-    "deploy",
-    "post_deploy",
-)
-
-SCRIPT_STAGES = (
-    "pre_sync",
-    "post_sync",
-    "pre_build",
-    "post_build",
-    "pre_deploy",
-    "post_deploy",
-)
-
-DEFAULT_WHERE: dict[str, Where] = {
-    "pre_sync": "dev",
-    "post_sync": "build",
-    "pre_build": "build",
-    "post_build": "build",
-    "pre_deploy": "target",
-    "post_deploy": "target",
-}
+PRIVATE_CONFIG_FILENAME = ".private.ferry.yaml"
 
 DEFAULT_IGNORES = [
     ".git",
     ".ferry",
+    ".private.ferry.yaml",
+    ".env",
     ".venv",
     "__pycache__",
     "node_modules",
 ]
 
+# A single string is a shell command; a list is a list of script paths.
+CommandSpec = str | list[str]
+NodeConfig = str | dict[str, Any] | None
+
 
 class ConfigError(Exception):
+    pass
+
+
+class NodeConfigMissing(ConfigError):
     pass
 
 
@@ -59,131 +39,154 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _validate_remote_path(value: str) -> str:
-    if not value.startswith("/"):
-        raise ValueError("must be an absolute path on the remote node")
-    if ".." in PurePosixPath(value).parts:
-        raise ValueError("must not contain '..'")
+def _is_absolute_path(value: str) -> bool:
+    text = value.strip()
+    return text.startswith("/") or bool(re.match(r"^[A-Za-z]:[\\/]", text))
+
+
+def _validate_workdir(value: str) -> str:
+    if not value.strip():
+        raise ValueError("must not be empty")
+    if not _is_absolute_path(value):
+        raise ValueError("must be an absolute path")
     return value
 
 
 def _validate_relative_path(value: str) -> str:
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
-    if path.is_absolute():
+    if path.is_absolute() or re.match(r"^[A-Za-z]:/", normalized):
         raise ValueError("must be a relative path")
     if ".." in path.parts:
         raise ValueError("must not contain '..'")
+    if not normalized or normalized == ".":
+        raise ValueError("must not be empty")
     return normalized
 
 
-class BuildCfg(StrictModel):
-    node: str
-    workdir: str
-    clean: list[str] | None = None
-    ssh_key: str | None = None
-
-    @field_validator("node")
-    @classmethod
-    def _node(cls, value: str) -> str:
+def _apply_command_validator(value: CommandSpec | None, *, required: bool) -> CommandSpec | None:
+    if value is None:
+        if required:
+            raise ValueError("this field is required")
+        return None
+    if isinstance(value, str):
         if not value.strip():
-            raise ValueError("must not be empty")
+            raise ValueError("shell command must not be empty")
         return value
-
-    @field_validator("workdir")
-    @classmethod
-    def _workdir(cls, value: str) -> str:
-        return _validate_remote_path(value)
-
-    @field_validator("ssh_key")
-    @classmethod
-    def _ssh_key(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _validate_remote_path(value)
-
-    @field_validator("clean")
-    @classmethod
-    def _clean(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return None
-        return [_validate_relative_path(item) for item in value]
+    if not isinstance(value, list):
+        raise ValueError("must be a shell command string or a list of script paths")
+    if required and not value:
+        raise ValueError("must contain at least one command or script")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("script paths must be non-empty strings")
+        _validate_relative_path(item)
+    return [_validate_relative_path(item) for item in value]
 
 
-class DeployCfg(StrictModel):
-    node: str
-    path: str
+class InlineNode(StrictModel):
+    model_config = ConfigDict(extra="allow")
 
-    @field_validator("node")
-    @classmethod
-    def _node(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("must not be empty")
-        return value
-
-    @field_validator("path")
-    @classmethod
-    def _path(cls, value: str) -> str:
-        return _validate_remote_path(value)
-
-
-class ToolchainCfg(StrictModel):
-    probe: str | None = None
-    expect: str | None = None
+    hostname: str | None = None
+    user: str | None = None
+    port: int | str | None = None
 
     @model_validator(mode="after")
-    def _pair(self) -> ToolchainCfg:
-        if self.expect is not None and self.probe is None:
-            raise ValueError("toolchain.expect requires toolchain.probe")
+    def _validate_host_alias(self) -> InlineNode:
+        extras = dict(self.model_extra or {})
+        hostname = (
+            self.hostname
+            or extras.get("HostName")
+            or extras.get("hostName")
+            or extras.get("hostname")
+        )
+        if not isinstance(hostname, str) or not hostname.strip():
+            raise ValueError("inline node requires a non-empty hostname")
+        for key, item in extras.items():
+            if key.lower() in {"host", "match", "include"}:
+                raise ValueError(f"{key!r} is not allowed in an inline node")
+            if not isinstance(item, (str, int, float, bool)):
+                raise ValueError(
+                    f"inline node option {key!r} must be a scalar value"
+                )
         return self
+
+    def resolved_name(self) -> str:
+        extras = self.model_extra or {}
+        hostname = (
+            self.hostname
+            or extras.get("HostName")
+            or extras.get("hostName")
+            or extras.get("hostname")
+        )
+        return str(hostname)
 
 
 class SyncCfg(StrictModel):
     ignore: list[str] = Field(default_factory=lambda: list(DEFAULT_IGNORES))
 
 
-class StageScripts(StrictModel):
-    pre_sync: list[str] = Field(default_factory=list)
-    post_sync: list[str] = Field(default_factory=list)
-    pre_build: list[str] = Field(default_factory=list)
-    post_build: list[str] = Field(default_factory=list)
-    pre_deploy: list[str] = Field(default_factory=list)
-    post_deploy: list[str] = Field(default_factory=list)
+class BuildCfg(StrictModel):
+    node: str | InlineNode | None = None
+    workdir: str
+    out: str | list[str]
+    before_build: CommandSpec | None = None
+    run_build: CommandSpec
+    after_build: CommandSpec | None = None
 
-    @field_validator("*")
+    @field_validator("node")
     @classmethod
-    def _scripts(cls, value: list[str]) -> list[str]:
-        for item in value:
-            if not isinstance(item, str) or not item.strip():
-                raise ValueError("script entries must be non-empty strings")
+    def _node(cls, value: str | InlineNode | None) -> str | InlineNode | None:
+        if isinstance(value, str) and value in {"dev.node", "build.node"}:
+            raise ValueError("build.node must be a concrete alias or inline host alias")
         return value
 
-    def for_stage(self, stage: str) -> list[str]:
-        if stage not in SCRIPT_STAGES:
-            return []
-        return list(getattr(self, stage))
-
-
-class TargetCfg(StrictModel):
-    build: BuildCfg
-    deploy: DeployCfg
-    toolchain: ToolchainCfg = Field(default_factory=ToolchainCfg)
-    build_cmd: str
-    out: str = "dist"
-    stages: StageScripts = Field(default_factory=StageScripts)
-    sync: SyncCfg = Field(default_factory=SyncCfg)
-
-    @field_validator("build_cmd")
+    @field_validator("workdir")
     @classmethod
-    def _build_cmd(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("must not be empty")
-        return value
+    def _workdir(cls, value: str) -> str:
+        normalized = _validate_workdir(value)
+        if not normalized.startswith("/"):
+            raise ValueError("build.workdir must be an absolute POSIX path")
+        return normalized
 
     @field_validator("out")
     @classmethod
-    def _out(cls, value: str) -> str:
-        return _validate_relative_path(value)
+    def _out(cls, value: str | list[str]) -> str | list[str]:
+        if isinstance(value, str):
+            return _validate_relative_path(value)
+        if not value:
+            raise ValueError("out must contain at least one path")
+        return [_validate_relative_path(item) for item in value]
+
+    @field_validator("before_build", "run_build", "after_build", mode="before")
+    @classmethod
+    def _commands(cls, value: CommandSpec | None, info: Any) -> CommandSpec | None:
+        return _apply_command_validator(value, required=info.field_name == "run_build")
+
+
+class DeployCfg(StrictModel):
+    node: str | InlineNode | None = None
+    transfer_from: Literal["dev.node", "build.node"] | None = None
+    workdir: str
+    before_deploy: CommandSpec | None = None
+    run_deploy: CommandSpec
+    after_deploy: CommandSpec | None = None
+
+    @field_validator("workdir")
+    @classmethod
+    def _workdir(cls, value: str) -> str:
+        return _validate_workdir(value)
+
+    @field_validator("before_deploy", "run_deploy", "after_deploy", mode="before")
+    @classmethod
+    def _commands(cls, value: CommandSpec | None, info: Any) -> CommandSpec | None:
+        return _apply_command_validator(value, required=info.field_name == "run_deploy")
+
+
+class TargetCfg(StrictModel):
+    sync: SyncCfg = Field(default_factory=SyncCfg)
+    build: BuildCfg
+    deploy: DeployCfg
 
 
 class ProjectCfg(StrictModel):
@@ -204,49 +207,19 @@ class FerryConfig(StrictModel):
 
 
 @dataclass(frozen=True)
-class ResolvedScript:
-    spec: str
-    path: str
-    where: Where
-
-
-@dataclass(frozen=True)
 class LoadedConfig:
     config: FerryConfig
     root: Path
     path: Path
-
-
-def parse_script_spec(spec: str, stage: str) -> ResolvedScript:
-    if stage not in DEFAULT_WHERE:
-        raise ConfigError(f"stage {stage!r} does not accept user scripts")
-    text = spec.strip()
-    where = DEFAULT_WHERE[stage]
-    if "@" in text:
-        path_text, suffix = text.rsplit("@", 1)
-        if suffix not in ("dev", "build", "target"):
-            raise ConfigError(
-                f"invalid script spec {spec!r}: suffix must be @dev, @build or @target"
-            )
-        where = suffix  # type: ignore[assignment]
-        text = path_text
-    if not text:
-        raise ConfigError(f"invalid script spec {spec!r}: missing path")
-    try:
-        normalized = _validate_relative_path(text)
-    except ValueError as exc:
-        raise ConfigError(f"invalid script spec {spec!r}: {exc}") from exc
-    return ResolvedScript(spec=spec, path=normalized, where=where)
-
-
-def resolve_stage_scripts(target: TargetCfg, stage: str) -> list[ResolvedScript]:
-    return [parse_script_spec(spec, stage) for spec in target.stages.for_stage(stage)]
+    private_path: Path | None = None
 
 
 def find_project_root(start: Path | None = None) -> Path:
     current = (start or Path.cwd()).resolve()
     for directory in (current, *current.parents):
-        if (directory / CONFIG_FILENAME).is_file():
+        if (directory / CONFIG_FILENAME).is_file() or (
+            directory / PRIVATE_CONFIG_FILENAME
+        ).is_file():
             return directory
     raise ConfigError(
         f"no {CONFIG_FILENAME} found from {current}; run 'ferry init' first"
@@ -255,29 +228,60 @@ def find_project_root(start: Path | None = None) -> Path:
 
 def load_config(start: Path | None = None) -> LoadedConfig:
     root = find_project_root(start)
-    path = root / CONFIG_FILENAME
-    text = path.read_text(encoding="utf-8")
+    private = root / PRIVATE_CONFIG_FILENAME
+    public = root / CONFIG_FILENAME
+    source = private if private.is_file() else public
+    if not source.is_file():
+        raise ConfigError(
+            f"no {CONFIG_FILENAME} found in {root}; run 'ferry init' first"
+        )
+    text = source.read_text(encoding="utf-8")
     try:
         raw: Any = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
+        raise ConfigError(f"invalid YAML in {source}: {exc}") from exc
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path} must contain a YAML mapping")
+        raise ConfigError(f"{source} must contain a YAML mapping")
     try:
         config = FerryConfig.model_validate(raw)
     except Exception as exc:
-        raise ConfigError(f"invalid {path}:\n{exc}") from exc
+        raise ConfigError(f"invalid {source}:\n{exc}") from exc
     if not config.project.name:
         config.project.name = root.name
-    return LoadedConfig(config=config, root=root, path=path)
+    return LoadedConfig(
+        config=config,
+        root=root,
+        path=source,
+        private_path=private if private.is_file() else None,
+    )
+
+
+def require_nodes(config: FerryConfig) -> None:
+    missing: list[str] = []
+    for name, target in config.targets.items():
+        if target.build.node is None:
+            missing.append(f"{name}.build.node")
+        if target.deploy.node is None:
+            missing.append(f"{name}.deploy.node")
+    if missing:
+        raise NodeConfigMissing(
+            "missing node definitions: "
+            + ", ".join(missing)
+            + ". Run 'ferry up' to fill them in, or create .private.ferry.yaml"
+            " with the real node settings."
+        )
 
 
 def config_to_yaml(config: FerryConfig) -> str:
     data = config.model_dump(mode="json", exclude_none=True)
     body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
     return "# Ferry project configuration. Commit this file with your project.\n" + body
+
+
+def initial_config(project_name: str) -> FerryConfig:
+    return FerryConfig(project=ProjectCfg(name=project_name), targets={})
 
 
 def diff_config(old: str, new: str, filename: str = CONFIG_FILENAME) -> str:
@@ -289,49 +293,3 @@ def diff_config(old: str, new: str, filename: str = CONFIG_FILENAME) -> str:
             tofile=f"{filename} (proposed)",
         )
     )
-
-
-def initial_config(project_name: str) -> FerryConfig:
-    return FerryConfig(project=ProjectCfg(name=project_name), targets={})
-
-
-def add_target(
-    config: FerryConfig, name: str, target: TargetCfg, *, replace: bool = False
-) -> FerryConfig:
-    if name in config.targets and not replace:
-        raise ConfigError(
-            f"target {name!r} already exists; rerun with --reset to replace it"
-        )
-    return config.model_copy(update={"targets": {**config.targets, name: target}})
-
-
-def first_component(path: str) -> str:
-    parts = PurePosixPath(path).parts
-    return parts[0] if parts else path
-
-
-__all__ = [
-    "CONFIG_FILENAME",
-    "BuildCfg",
-    "ConfigError",
-    "DeployCfg",
-    "FerryConfig",
-    "LoadedConfig",
-    "ProjectCfg",
-    "ResolvedScript",
-    "SCRIPT_STAGES",
-    "STAGE_ORDER",
-    "StageScripts",
-    "SyncCfg",
-    "TargetCfg",
-    "ToolchainCfg",
-    "add_target",
-    "config_to_yaml",
-    "diff_config",
-    "find_project_root",
-    "first_component",
-    "initial_config",
-    "load_config",
-    "parse_script_spec",
-    "resolve_stage_scripts",
-]

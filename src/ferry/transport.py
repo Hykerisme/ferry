@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 import shlex
 import tarfile
 import uuid
@@ -9,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO
 
-from .config import first_component
-from .executors import ExecError, Executor
+from .executors import ExecError, Executor, Host
+from .nodes import NodeSpec
 
 
 def is_ignored(relative: str, patterns: list[str]) -> bool:
@@ -28,11 +29,21 @@ def is_ignored(relative: str, patterns: list[str]) -> bool:
     return False
 
 
-def effective_ignores(patterns: list[str], out: str) -> list[str]:
+def first_component(value: str) -> str:
+    parts = PurePosixPath(value.replace("\\", "/")).parts
+    return parts[0] if parts else value
+
+
+def effective_ignores(patterns: list[str], outs: str | list[str]) -> list[str]:
     ignores = list(patterns)
-    top = first_component(out)
-    if top and top not in ignores:
-        ignores.append(top)
+    for mandatory in (".private.ferry.yaml", ".env"):
+        if mandatory not in ignores:
+            ignores.append(mandatory)
+    entries = [outs] if isinstance(outs, str) else outs
+    for entry in entries:
+        top = first_component(entry)
+        if top and top not in ignores:
+            ignores.append(top)
     return ignores
 
 
@@ -81,7 +92,7 @@ def write_tar(stream: IO[bytes], root: Path, patterns: list[str]) -> int:
 
 def upload_tree(
     executor: Executor,
-    host: str,
+    host: Host,
     probe_path: str,
     dest: str,
     root: Path,
@@ -95,13 +106,14 @@ def upload_tree(
         process.close_stdin()
     except (BrokenPipeError, OSError) as exc:
         process.terminate()
-        raise ExecError(f"upload to {host} failed: {exc}") from exc
+        raise ExecError(f"upload to {dest} failed: {exc}") from exc
     stdout = process.stdout.read() if process.stdout is not None else b""
     stderr = process.stderr.read() if process.stderr is not None else b""
     code = process.wait()
     if code != 0:
         raise ExecError(
-            f"probe put on {host} failed ({code}): {stderr.decode('utf-8', 'replace').strip()}"
+            f"probe put on {dest} failed ({code}): "
+            f"{stderr.decode('utf-8', 'replace').strip()}"
         )
     return count, stdout.decode("utf-8", errors="replace").strip()
 
@@ -128,61 +140,6 @@ def safe_extract(stream: IO[bytes], destination: Path) -> int:
     return count
 
 
-def artifact_push_command(
-    out: str,
-    target_host: str,
-    deploy_path: str,
-    *,
-    key: str | None = None,
-) -> str:
-    remote = (
-        f"mkdir -p {shlex.quote(deploy_path)} && "
-        f"tar -xf - -C {shlex.quote(deploy_path)}"
-    )
-    options = [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    if key:
-        options.extend(["-i", key])
-    ssh = "ssh " + " ".join(shlex.quote(item) for item in options)
-    ssh += f" {shlex.quote(target_host)} {shlex.quote(remote)}"
-    return f"tar -C {shlex.quote(out)} -cf - . | {ssh}"
-
-
-def push_stream_to_target(
-    executor: Executor,
-    target_host: str,
-    deploy_path: str,
-    chunks: Iterable[bytes],
-) -> None:
-    remote = (
-        f"mkdir -p {shlex.quote(deploy_path)} && "
-        f"tar -xf - -C {shlex.quote(deploy_path)}"
-    )
-    process = executor.spawn(target_host, ["sh", "-c", remote])
-    if process.stdin is None:
-        raise ExecError("failed to open target ssh stdin")
-    try:
-        for chunk in chunks:
-            process.send(chunk)
-        process.close_stdin()
-    except (BrokenPipeError, OSError) as exc:
-        process.terminate()
-        raise ExecError(f"failed to push artifacts to {target_host}: {exc}") from exc
-    stderr = process.stderr.read() if process.stderr else b""
-    code = process.wait()
-    if code != 0:
-        raise ExecError(
-            f"artifact extraction failed on {target_host} ({code}): "
-            f"{stderr.decode('utf-8', 'replace').strip()}"
-        )
-
-
 @dataclass
 class RemoteScriptOutcome:
     code: int
@@ -191,9 +148,38 @@ class RemoteScriptOutcome:
     result: str | None
 
 
+def push_stream_to_target(
+    executor: Executor,
+    host: Host,
+    workdir: str,
+    chunks: Iterable[bytes],
+) -> None:
+    remote = (
+        f"mkdir -p {shlex.quote(workdir)} && "
+        f"tar -xf - -C {shlex.quote(workdir)}"
+    )
+    process = executor.spawn(host, ["sh", "-c", remote])
+    if process.stdin is None:
+        raise ExecError("failed to open target stdin")
+    try:
+        for chunk in chunks:
+            process.send(chunk)
+        process.close_stdin()
+    except (BrokenPipeError, OSError) as exc:
+        process.terminate()
+        raise ExecError(f"failed to push artifacts: {exc}") from exc
+    stderr = process.stderr.read() if process.stderr else b""
+    code = process.wait()
+    if code != 0:
+        raise ExecError(
+            f"artifact extraction failed ({code}): "
+            f"{stderr.decode('utf-8', 'replace').strip()}"
+        )
+
+
 def run_target_script(
     executor: Executor,
-    host: str,
+    host: Host,
     script: bytes,
     cwd: str,
     env: dict[str, str],
@@ -235,3 +221,74 @@ def run_target_script(
         stderr=completed.stderr_text,
         result=result,
     )
+
+
+def artifact_parts(source: str, is_dir: bool) -> tuple[str, str]:
+    if is_dir:
+        return source, "."
+    return posixpath.dirname(source), posixpath.basename(source)
+
+
+def ssh_command(
+    node: NodeSpec,
+    remote: str,
+    *,
+    key: str | None = None,
+) -> str:
+    args = [
+        "ssh",
+        *node.ssh_options(),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if key:
+        args.extend(["-i", key])
+    args.append(node.destination)
+    args.append(remote)
+    return " ".join(shlex.quote(item) for item in args)
+
+
+def artifact_transfer_command(
+    source: str,
+    is_dir: bool,
+    target: NodeSpec,
+    workdir: str,
+    *,
+    key: str | None = None,
+) -> str:
+    root, name = artifact_parts(source, is_dir)
+    remote = (
+        f"mkdir -p {shlex.quote(workdir)} && "
+        f"tar -xf - -C {shlex.quote(workdir)}"
+    )
+    ssh = ssh_command(target, remote, key=key)
+    return f"tar -C {shlex.quote(root)} -cf - {shlex.quote(name)} | {ssh}"
+
+
+def artifact_copy_command(source: str, is_dir: bool, workdir: str) -> str:
+    if is_dir:
+        return (
+            f"mkdir -p {shlex.quote(workdir)} && "
+            f"cp -a {shlex.quote(source)}/. {shlex.quote(workdir)}/"
+        )
+    return (
+        f"mkdir -p {shlex.quote(workdir)} && "
+        f"cp -a {shlex.quote(source)} {shlex.quote(workdir)}/"
+    )
+
+
+def classify_artifacts_command(workdir: str, entries: list[str]) -> str:
+    quoted_workdir = shlex.quote(workdir)
+    lines = [f"cd {quoted_workdir} 2>/dev/null || true"]
+    for entry in entries:
+        quoted = shlex.quote(entry)
+        lines.append(
+            f'if [ -d {quoted} ]; then echo "dir:{entry}"; '
+            f'elif [ -f {quoted} ]; then echo "file:{entry}"; '
+            f'else echo "missing:{entry}"; fi'
+        )
+    return "; ".join(lines)

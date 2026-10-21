@@ -15,6 +15,7 @@ from . import __version__
 from .executors import (
     ExecError,
     Executor,
+    Host,
     Process,
     explain_ssh_failure,
     remote_mkdir_and_upload,
@@ -36,11 +37,69 @@ def probe_source_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "probe"
 
 
+@dataclass(frozen=True)
+class Platform:
+    id: str
+    goos: str
+    goarch: str
+    goarm: str | None
+    machines: tuple[str, ...]
+    default_bundle: bool
+
+
 def bundled_probe_dir() -> Path:
     return Path(__file__).resolve().parent / "_probes"
 
 
-def bundled_probe(arch: str) -> tuple[Path, str] | None:
+def platforms_path() -> Path:
+    return bundled_probe_dir() / "platforms.json"
+
+
+def load_platforms() -> list[Platform]:
+    path = platforms_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProbeError(f"cannot read platform matrix {path}: {exc}") from exc
+    platforms: list[Platform] = []
+    for item in payload.get("platforms", []):
+        platforms.append(
+            Platform(
+                id=str(item["id"]),
+                goos=str(item.get("goos", "linux")),
+                goarch=str(item["goarch"]),
+                goarm=str(item["goarm"]) if item.get("goarm") else None,
+                machines=tuple(str(machine).lower() for machine in item.get("machines", [])),
+                default_bundle=bool(item.get("default_bundle", False)),
+            )
+        )
+    return platforms
+
+
+def platform_by_id(platform_id: str) -> Platform | None:
+    for platform in load_platforms():
+        if platform.id == platform_id:
+            return platform
+    return None
+
+
+def platform_for_machine(machine: str) -> Platform | None:
+    normalized = machine.lower()
+    for platform in load_platforms():
+        if normalized in platform.machines:
+            return platform
+    return None
+
+
+def supported_machines() -> str:
+    return ", ".join(
+        f"{machine} ({platform.id})"
+        for platform in load_platforms()
+        for machine in platform.machines
+    )
+
+
+def bundled_probe(platform_id: str) -> tuple[Path, str] | None:
     directory = bundled_probe_dir()
     manifest_path = directory / "manifest.json"
     if not manifest_path.is_file():
@@ -52,7 +111,10 @@ def bundled_probe(arch: str) -> tuple[Path, str] | None:
     if manifest.get("version") != PROBE_VERSION:
         return None
     digest = manifest.get("hash")
-    relative = (manifest.get("architectures") or {}).get(arch)
+    mapping = manifest.get("platforms") or manifest.get("architectures") or {}
+    relative = mapping.get(platform_id)
+    if relative is None and platform_id.startswith("linux-"):
+        relative = mapping.get(platform_id.removeprefix("linux-"))
     if not digest or not relative:
         return None
     probe = directory / relative
@@ -73,22 +135,25 @@ def source_hash(source: Path | None = None) -> str:
     return digest.hexdigest()[:12]
 
 
-def ensure_local_probe(arch: str, *, rebuild: bool = False) -> tuple[Path, str]:
+def ensure_local_probe(platform_id: str, *, rebuild: bool = False) -> tuple[Path, str]:
     source = probe_source_dir()
-    bundled = bundled_probe(arch)
+    bundled = bundled_probe(platform_id)
     if bundled is not None:
         bundled_path, bundled_hash = bundled
         if not source.is_dir() or bundled_hash == source_hash(source):
-            return _install_bundled(bundled_path, bundled_hash, arch, rebuild)
+            return _install_bundled(bundled_path, bundled_hash, platform_id, rebuild)
 
     digest = source_hash()
-    target = bin_dir() / f"probe-linux-{arch}-{digest}"
+    target = bin_dir() / f"probe-{platform_id}-{digest}"
     if target.is_file() and not rebuild:
         return target, digest
     if not source.is_dir():
+        supported = ", ".join(platform.id for platform in load_platforms())
         raise ProbeError(
-            "no bundled probe for this architecture and probe sources are not "
-            "available; install a release wheel or set FERRY_PROBE_SRC"
+            f"no bundled probe for {platform_id!r} and probe sources are not "
+            f"available; bundled platforms: {supported or 'none'}. "
+            "Use a build node whose 'uname -m' is in platforms.json, or install "
+            "from a source checkout with Go."
         )
     script = Path(__file__).resolve().parents[2] / "scripts" / "build_probe.py"
     if not script.is_file():
@@ -97,21 +162,37 @@ def ensure_local_probe(arch: str, *, rebuild: bool = False) -> tuple[Path, str]:
             "install Ferry from the repository or set FERRY_PROBE_SRC"
         )
     result = subprocess.run(
-        [sys.executable, str(script), "--arch", arch, "--out-dir", str(bin_dir())],
+        [
+            sys.executable,
+            str(script),
+            "--platform",
+            platform_id,
+            "--out-dir",
+            str(bin_dir()),
+        ],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         raise ProbeError(
-            f"failed to build probe for {arch} (is Go installed?): {result.stderr.strip()}"
+            f"failed to build probe for {platform_id} (is Go installed?): "
+            f"{result.stderr.strip()}"
         )
     if not target.is_file():
         raise ProbeError(f"probe build did not produce {target}")
     return target, digest
 
 
-def _install_bundled(path: Path, digest: str, arch: str, rebuild: bool) -> tuple[Path, str]:
-    target = bin_dir() / f"probe-linux-{arch}-{digest}"
+def _install_bundled(
+    path: Path, digest: str, platform_id: str, rebuild: bool
+) -> tuple[Path, str]:
+    if digest.encode("ascii") not in path.read_bytes():
+        raise ProbeError(
+            f"bundled probe {path} does not contain the manifest hash {digest}. "
+            "The package was built with a stale probe binary; rebuild it with "
+            "'uv run python scripts/build_probe.py --bundle'."
+        )
+    target = bin_dir() / f"probe-{platform_id}-{digest}"
     bin_dir().mkdir(parents=True, exist_ok=True)
     if (
         rebuild
@@ -123,16 +204,19 @@ def _install_bundled(path: Path, digest: str, arch: str, rebuild: bool) -> tuple
     return target, digest
 
 
-def detect_arch(executor: Executor, host: str) -> str:
+def detect_platform(executor: Executor, host: Host) -> Platform:
     result = executor.run(host, ["uname", "-m"], timeout=15)
     if result.returncode != 0:
         raise ProbeError(explain_ssh_failure(host, result.stderr_text))
     machine = result.stdout_text.strip().lower()
-    if machine in ("x86_64", "amd64"):
-        return "amd64"
-    if machine in ("aarch64", "arm64"):
-        return "arm64"
-    raise ProbeError(f"unsupported remote architecture on {host}: {machine or 'unknown'}")
+    platform = platform_for_machine(machine)
+    if platform is None:
+        raise ProbeError(
+            f"unsupported build machine architecture {machine or 'unknown'!r} on "
+            f"{host}; supported: {supported_machines()}. Add the architecture to "
+            "src/ferry/_probes/platforms.json and rebuild the probe."
+        )
+    return platform
 
 
 def parse_version(text: str) -> ProbeVersion:
@@ -145,7 +229,7 @@ def parse_version(text: str) -> ProbeVersion:
     raise ProbeError(f"probe did not return a version document: {text.strip()}")
 
 
-def handshake(executor: Executor, host: str, remote_path: str) -> ProbeVersion | None:
+def handshake(executor: Executor, host: Host, remote_path: str) -> ProbeVersion | None:
     result = executor.run(host, [remote_path, "version"], timeout=20)
     if result.returncode != 0:
         return None
@@ -158,7 +242,7 @@ def handshake(executor: Executor, host: str, remote_path: str) -> ProbeVersion |
 @dataclass
 class RemoteProbe:
     executor: Executor
-    host: str
+    host: Host
     path: str
     version: ProbeVersion
     _process: Process | None = None
@@ -260,17 +344,17 @@ class RemoteProbe:
 
 def ensure_remote_probe(
     executor: Executor,
-    host: str,
+    host: Host,
     workdir: str,
     *,
-    arch: str | None = None,
+    platform: str | None = None,
     reset: bool = False,
 ) -> RemoteProbe:
-    arch = arch or detect_arch(executor, host)
-    local_path, digest = ensure_local_probe(arch)
+    platform_id = platform or detect_platform(executor, host).id
+    local_path, digest = ensure_local_probe(platform_id)
     candidates = [
         f"/tmp/.ferry-probe-{digest}/probe",
-        f"{workdir.rstrip('/')}/.ferry/probe-linux-{arch}-{digest}",
+        f"{workdir.rstrip('/')}/.ferry/probe-{platform_id}-{digest}",
     ]
     if not reset:
         for candidate in candidates:
@@ -289,15 +373,23 @@ def ensure_remote_probe(
         version = handshake(executor, host, candidate)
         if version is not None and version.hash == digest:
             return RemoteProbe(executor=executor, host=host, path=candidate, version=version)
-        errors.append(f"{candidate} is not executable or reports a different hash")
+        if version is None:
+            errors.append(f"{candidate} is not executable")
+        else:
+            errors.append(
+                f"{candidate} reports hash {version.hash or '(none)'}, "
+                f"expected {digest} for platform {platform_id}"
+            )
     raise ProbeError(
-        "failed to install probe on "
-        f"{host}: {'; '.join(errors) or 'unknown error'}. "
+        f"failed to install probe on {host} (platform {platform_id}, "
+        f"expected build hash {digest}): {'; '.join(errors) or 'unknown error'}. "
+        "If the hash differs, the local probe bundle is stale; rebuild it with "
+        "'uv run python scripts/build_probe.py --bundle' or use --reset-probe. "
         f"If /tmp is mounted noexec, ensure {workdir} is writable."
     )
 
 
-def cancel_remote(executor: Executor, host: str, pids: list[int]) -> None:
+def cancel_remote(executor: Executor, host: Host, pids: list[int]) -> None:
     targets = " ".join(str(pid) for pid in pids if pid > 0)
     if not targets:
         return

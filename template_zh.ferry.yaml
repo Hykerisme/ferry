@@ -1,0 +1,97 @@
+# ============================================================
+# Ferry 项目配置模板
+# 位置：项目根目录的 .ferry.yaml（从 cwd 向上查找最近的一份）
+# 该文件与 scripts/ 一起提交到 git
+#
+# 节点机器信息建议放在 .private.ferry.yaml：
+#   - .private.ferry.yaml 始终加入 .gitignore，不会被同步到构建机
+#   - 每次 run 成功后，Ferry 会根据它重新生成 .ferry.yaml
+#   - 生成的 .ferry.yaml 会移除 node 定义，其他人使用时必须自行填写
+#   - 缺少 node 定义时，Ferry 会中断并提示用户
+#
+# 如果项目根目录存在 .env，Ferry 会自动加载并注入所有阶段脚本。
+# 不要把密码或 token 提交到 git。
+# ============================================================
+
+version: 1
+
+# project:
+#   name: demo        # 默认：.ferry.yaml 所在目录名
+
+targets:
+  t507:  # 目标机昵称，不影响构建流程
+
+    # ---------------- 同步 ----------------
+    sync:
+      ignore:
+        - .git
+        - .ferry
+        - .private.ferry.yaml
+        - .env
+        - .venv
+        - __pycache__
+        - node_modules
+
+    # ---------------- 开发节点 ----------------
+    # 运行 Ferry 的主机就是 dev，不需要配置。
+    # dev:
+    #   node: ...
+
+    # ---------------- 构建节点 ----------------
+    build:
+      # 必填。SSH Host 别名，或 inline host alias。
+      # inline 写法支持与 ~/.ssh/config 的 Host 块相同的字段。
+      # build.node 必须显式定义，不能引用 dev.node/build.node。
+      node: buildvm
+      # node:
+      #   hostname: "localhost"
+      #   port: "12345"
+      #   user: "root"
+
+      # 必填。构建机上的绝对可写路径；所有 build 阶段命令以它为 cwd。
+      workdir: "/work/demo"
+
+      # 必填。要传输的产物，路径相对 build.workdir。
+      # 目录 -> 递归复制目录内容；文件 -> 复制文件；数组 -> 逐个复制。
+      out: "./build/out"
+      # out: ["./build/a.out", "./build/b.lib"]
+
+      # 执行顺序：before_build -> 同步代码 -> run_build -> after_build
+      # 单字符串 = shell 命令；字符串数组 = 按顺序执行的脚本路径。
+      # before_build 可选。
+      before_build: "echo prepare to build"
+      # before_build: ["./scripts/build_phase_1.sh", "./scripts/build_phase_2.sh"]
+
+      # 必填。
+      run_build: "echo building"
+
+      # 可选。
+      after_build: "echo build completed"
+
+    # ---------------- 目标节点 ----------------
+    deploy:
+      # 必填。SSH Host 别名、inline host alias，或节点引用：
+      #   dev.node   -> 在开发机执行部署
+      #   build.node -> 在构建机执行部署
+      node: board
+      # node: dev.node
+
+      # 可选。产物来源：dev.node 或 build.node，覆盖自动拓扑判断。
+      # 当 deploy.node 为 dev.node/build.node 时，此项被忽略并警告。
+      # transfer_from: build.node
+
+      # 必填。目标机上的绝对路径；所有 deploy 阶段命令以它为 cwd。
+      # 在 dev/build 上执行时，会检查目录是否互相包含并警告。
+      workdir: /opt/app
+
+      # 执行顺序：before_deploy -> 传输产物 -> run_deploy -> after_deploy
+      # 单字符串 = shell 命令；字符串数组 = 按顺序执行的脚本路径。
+      # before_deploy 可选。
+      before_deploy: "echo prepare to deploy"
+      # before_deploy: ["./scripts/deploy_phase_1.sh"]
+
+      # 必填。
+      run_deploy: "echo deploying"
+
+      # 可选。
+      after_deploy: "echo deploy completed"

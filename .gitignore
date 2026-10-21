@@ -8,6 +8,8 @@ dist/
 build/
 *.egg-info/
 .ferry/
+.private.ferry.yaml
+.env
 src/ferry/_probes/*/probe
 src/ferry/_probes/manifest.json
 probe/ferry-probe

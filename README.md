@@ -2,10 +2,10 @@
 
 [ [简体中文](README.md) | [English](README_EN.md) ]
 
-**Ferry是一个轻量级的自动化部署工具，专为个人和工作室级的定制化构建流程。** <br>
+**Ferry是一个轻量级的自动化部署工具，专为个人和工作室级的定制化构建流程。** `<br>`
 服务于以下结构：`[开发机] -> [构建机] -> [目标部署机]`
 
-Ferry把 **「同步代码 → 构建 → 产物路由 → 部署」** 的流程压缩成一次 `ferry run` ，<br>
+Ferry把 **「同步代码 → 构建 → 产物路由 → 部署」** 的流程压缩成一次 `ferry run` ，`<br>`
 设置好SSH的HostAlias之后，通过Yaml和Shell脚本来管理整个部署流程。
 
 Ferry将整个流程抽象为以下三个阶段：
@@ -14,12 +14,12 @@ Ferry将整个流程抽象为以下三个阶段：
 2. 按阶段触发用户脚本；
 3. 按 SSH 可达性路由产物和触发自动化脚本。
 
-传统的方案之一是 `Justfile + rsync + sshpass`，我们只是将整个流程设计的更人性化，并且**对异构和交叉构建更加友好**。 <br>
-**相比于CI方案，从零开始部署的成本也更低**，因为**Ferry并不依托于存储服务器或容器化Runner节点，针对只有busybox的平台也能更好工作。** <br>
+传统的方案之一是 `Justfile + rsync + sshpass`，我们只是将整个流程设计的更人性化，并且**对异构和交叉构建更加友好**。 `<br>`
+**相比于CI方案，从零开始部署的成本也更低**，因为**Ferry并不依托于存储服务器或容器化Runner节点，针对只有busybox的平台也能更好工作。** `<br>`
 就算你使用k230或MaixCAN之类的**基于带busybox的freertos平台，也可以使用Ferry来定制化流程**，可能一定程度上可以绕过低效或设计不友好的原构建流程。
 
-Ferry不强依赖于你已有的Makefile/CMake/GNinja经验，追求**通用化和多样化的组合式构建流程**。 <br>
-换言之，Ferry更像是一个构建适配器，通过Yaml配置化你的项目级构建节点和目标节点，通过Shell脚本来自定义你的构建流程。 <br>
+Ferry不强依赖于你已有的Makefile/CMake/GNinja经验，追求**通用化和多样化的组合式构建流程**。 `<br>`
+换言之，Ferry更像是一个构建适配器，通过Yaml配置化你的项目级构建节点和目标节点，通过Shell脚本来自定义你的构建流程。 `<br>`
 **任何会使用Unix命令行的人都可以轻松使用该工具**
 
 此外，由于探针设计轻量且尽可能的无依赖，构建机可以是无状态的虚拟机节点或者OCI容器。
@@ -29,16 +29,17 @@ Ferry不强依赖于你已有的Makefile/CMake/GNinja经验，追求**通用化�
 ```bash
 ferry init
 
-# 引导：校验节点、推送探针、生成 .ferry.yaml
+# 引导：校验节点、推送探针、生成 .private.ferry.yaml 和 .ferry.yaml
 # 我们以t507作为案例
 ferry up \
   --ssh buildvm \
   --target board \
   --name t507 \
   --build-workdir /work/demo \
-  --deploy-path /opt/app \
-  --build-cmd "cmake -B build && cmake --build build -j" \
-  --out build/out \
+  --deploy-workdir /opt/app \
+  --run-build "cmake -B build && cmake --build build -j" \
+  --run-deploy "echo deployed" \
+  --out ./build/out \
   --yes
 
 ferry plan t507      # dry-run：预览你的设置
@@ -78,7 +79,7 @@ uv tool install ferry-tool
 ferry --version
 ```
 
-发布包已内置 linux/amd64 与 linux/arm64 探针，安装后无需 Go。 <br>
+发布包已内置 linux/amd64、linux/arm64、linux/armv7 探针，安装后无需 Go。 `<br>`
 开发端依赖于python，应该可以多平台运行。
 
 若需要特殊平台的Ferry，自行构建十分容易（依赖于python环境和uv管理器）：
@@ -95,7 +96,7 @@ uv run ferry --help
 - **（可选）从源码运行时**需要 Go 1.22+（用于交叉编译探针；发布 wheel 不需要）
 - 开发机可通过 SSH 访问构建机与目标机（密钥或密码方式均可）
 - 目标机至少提供 `ssh` + `sh` + `tar`
-- Windows 开发机上的 dev 阶段脚本需要 POSIX `sh`（Git for Windows 自带）
+- 所有阶段脚本在 build 或 deploy 节点执行；`deploy.node: dev.node` 时需要本机 POSIX `sh`（Git for Windows 自带）
 
 > 目前开发机无需安装 rsync：dev→build 同步使用 Python `tarfile` 流 + ssh。
 
@@ -137,7 +138,7 @@ ferry run t507
 
 ## 配置
 
-`.ferry.yaml` 与 `scripts/` 随项目进 git。最小示例：
+`.ferry.yaml` 是可提交的公开配置；真实节点放在 `.private.ferry.yaml`（自动 gitignore、绝不同步）。成功 run 后 Ferry 会从 private 配置生成 `.ferry.yaml`，移除节点定义，其他内容和注释保留。项目根如有 `.env`，会自动加载并注入所有阶段命令/脚本。
 
 ```yaml
 version: 1
@@ -145,61 +146,48 @@ project:
   name: demo
 targets:
   t507:
+    sync:
+      ignore: [".git", ".ferry", ".private.ferry.yaml", ".env", ".venv", "__pycache__", "node_modules"]
     build:
       node: buildvm
       workdir: /work/demo
+      out: ./build/out
+      before_build: [scripts/check-env.sh]
+      run_build: "cmake -B build && cmake --build build -j"
+      after_build: [scripts/strip-symbols.sh]
     deploy:
       node: board
-      path: /opt/app
-    toolchain:
-      probe: "cat /opt/toolchain/VERSION"
-      expect: "v2.4.1"
-    build_cmd: "cmake -B build && cmake --build build -j"
-    out: build/out
-    stages:
-      post_sync: [scripts/check-env.sh]
-      post_build: [scripts/strip-symbols.sh]
-      pre_deploy: [scripts/stop-service.sh]
-      post_deploy: [scripts/install-service.sh, scripts/restart.sh]
+      transfer_from: build.node
+      workdir: /opt/app
+      before_deploy: [scripts/stop-service.sh]
+      run_deploy: "echo deployed"
+      after_deploy: [scripts/install-service.sh, scripts/restart.sh]
 ```
 
-脚本条目的执行位置：
+规则：
 
-| 写法                                                   | 位置     |
-| ------------------------------------------------------ | -------- |
-| `scripts/x.sh`（pre_sync）                           | dev      |
-| `scripts/x.sh`（post_sync / pre_build / post_build） | build    |
-| `scripts/x.sh`（pre_deploy / post_deploy）           | target   |
-| `scripts/x.sh@dev` / `@build` / `@target`        | 显式指定 |
-
-脚本运行在项目根（target 侧为部署目录），环境变量显式注入：
-
-```
-XB_TARGET_ARCH=arm64
-XB_TARGET_OS=ubuntu
-XB_TARGET_OS_VER=18.04
-XB_TARGET_INIT=systemd
-XB_TARGET_GLIBC=2.27
-XB_TARGET_HAS_RSYNC=0
-XB_TARGET_HAS_TAR=1
-XB_TARGET_HAS_SCP=1
-XB_BUILD_TOOLCHAIN_VER=v2.4.1
-```
-
-脚本可以向 `$FERRY_RESULT_FILE` 写一行诊断摘要；Ferry 原样回传。
+- 单字符串 = shell 命令；字符串数组 = 按顺序执行的脚本路径。
+- `run_build` / `run_deploy` 必填，`before_*` / `after_*` 可选。
+- 所有命令的 cwd 是 `build.workdir` 或 `deploy.workdir`；脚本在对应节点执行。
+- `before_*` 在批量传输前单独下发，适合做环境检查。
+- `out` 相对 `build.workdir`：目录递归复制内容，文件复制文件，数组逐项合并。
+- `node` 可以是 SSH Host 别名或 inline host alias；`deploy.node` 额外支持 `dev.node` / `build.node`。
+- `.env` 变量注入所有阶段脚本；`FERRY_*` 为保留前缀，`FERRY_RESULT_FILE` 每个脚本单独注入。
+- 脚本可以向 `$FERRY_RESULT_FILE` 写一行诊断摘要，Ferry 原样回传，不解析。
 
 ## 中断语义（如果你感兴趣的话）
 
-- 同一 target 的新 `run` 会在 sync 之前尝试获取构建锁，拿不到就拒绝；不会杀死正在运行的构建，也不会覆盖它正在使用的工作区。 <br>
+- 同一 target 的新 `run` 会在 sync 之前尝试获取构建锁，拿不到就拒绝；不会杀死正在运行的构建，也不会覆盖它正在使用的工作区。 `<br>`
   （不会自动杀死构建进程，避免构建流程中断）
 - `ferry run <target> --cancel` 发送 `SIGTERM`；探针把信号转发给构建进程组（比如docker和cmake会响应该信号并执行清理流程），等待 15 秒后才 `SIGKILL`。
-- 构建前写入 marker，正常结束（成功或普通失败）删除。异常中断会保留 marker；下次 `run` 检测到后清理构建目录来做一次全量，随后恢复增量。
+- `run_build` 前写入 marker，正常结束（成功或普通失败）删除。异常中断会保留 marker；下次 `run` 检测到后清理 `out` 的第一段目录并做一次全量。`before_build`/`sync` 阶段中断不写 marker。
 - 锁使用 `flock`，进程退出时由内核释放，避免僵尸 PID 文件。
 
 ## 本机数据列表
 
 ```
 ~/.ferry/bin/      # 按 hash 缓存的探针二进制
+~/.ferry/keys/     # Ferry 管理的密钥
 ~/.ferry/state/    # 每个 project/target 的最近一次运行状态
 ~/.ferry/logs/     # 运行日志
 ~/.ferry/cache/    # 拓扑探测缓存（TTL 5 分钟）
@@ -207,10 +195,12 @@ XB_BUILD_TOOLCHAIN_VER=v2.4.1
 
 ## 已知限制
 
-- 目标机必须提供 `tar`；无 tar 的降级链尚未实现。
+- 目标机必须提供 `tar` + `sh`；无 tar 的降级链尚未实现。
 - tar 同步不会删除构建机上已从源码删除的文件。
+- 多个 `out` 目录合并时，同名文件会覆盖并打印警告。
 - 密码模式下目标侧操作经 dev 中转；需要直连时先用 `up --ask-pass` 安装密钥。
-- 不做工具链归档包分发、构建缓存、并发调度、回滚、常驻服务。
+- 不提供 toolchain 探测/检查/分发；由 `before_build` / `run_build` 自行处理。
+- 不做构建缓存、并发调度、回滚、常驻服务。
 
 ## 获得发布Wheel
 
@@ -233,7 +223,7 @@ uv run python scripts/build_probe.py --bundle
 uv build
 uvx twine check dist/*
 uv run --isolated --with ./dist/ferry_tool-*-py3-none-any.whl \
-  python -c "from ferry.probe import ensure_local_probe; print(ensure_local_probe('amd64'))"
+  python -c "from ferry.probe import ensure_local_probe; print(ensure_local_probe('linux-amd64'))"
 ```
 
 ## 开发

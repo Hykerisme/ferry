@@ -173,10 +173,14 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 		remoteResultPath  string
 		localResultPath   string
 		removeLocalResult func()
+		removeScript      func()
 	)
 	defer func() {
 		if removeLocalResult != nil {
 			removeLocalResult()
+		}
+		if removeScript != nil {
+			removeScript()
 		}
 	}()
 
@@ -201,6 +205,7 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 		}
 		wrapper := targetWrapper(step, cwd, remoteResultPath)
 		args := []string{"ssh"}
+		args = append(args, req.TargetOptions...)
 		if req.TargetKey != "" {
 			args = append(args, "-i", req.TargetKey)
 		}
@@ -213,6 +218,36 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 		)
 		cmd = exec.Command(args[0], args[1:]...)
 		cmd.Stdin = bytes.NewReader(content)
+	} else if step.Kind == "script" && step.ScriptB64 != "" {
+		content, err := base64.StdEncoding.DecodeString(step.ScriptB64)
+		if err != nil {
+			return stepOutcome{code: exitUsage, tail: "invalid script encoding"}
+		}
+		file, err := os.CreateTemp("", "ferry-script-*.sh")
+		if err != nil {
+			return stepOutcome{code: exitUsage, tail: "cannot create script file: " + err.Error()}
+		}
+		scriptPath := file.Name()
+		if _, err := file.Write(content); err != nil {
+			_ = file.Close()
+			_ = os.Remove(scriptPath)
+			return stepOutcome{code: exitUsage, tail: "cannot write script: " + err.Error()}
+		}
+		_ = file.Chmod(0o700)
+		_ = file.Close()
+		removeScript = func() { _ = os.Remove(scriptPath) }
+		cmd = exec.Command("sh", scriptPath)
+		cmd.Env = append(os.Environ(), envList(step.Env)...)
+		if step.Result {
+			resultFile, err := os.CreateTemp("", "ferry-result-*")
+			if err != nil {
+				return stepOutcome{code: exitUsage, tail: "cannot create result file: " + err.Error()}
+			}
+			localResultPath = resultFile.Name()
+			_ = resultFile.Close()
+			cmd.Env = append(cmd.Env, "FERRY_RESULT_FILE="+localResultPath)
+			removeLocalResult = func() { _ = os.Remove(localResultPath) }
+		}
 	} else {
 		if len(step.Argv) == 0 {
 			return stepOutcome{code: exitUsage, tail: "empty argv"}
@@ -289,7 +324,7 @@ func executeStep(req ExecRequest, step Step, em *emitter, interrupted *atomic.Bo
 	var result *Result
 	if step.Result {
 		if step.Where == "target" {
-			result = fetchRemoteResult(remoteHost, remoteResultPath, req.TargetKey)
+			result = fetchRemoteResult(remoteHost, remoteResultPath, req.TargetKey, req.TargetOptions)
 		} else {
 			result = readLocalResult(localResultPath)
 		}
@@ -327,7 +362,7 @@ func readLocalResult(path string) *Result {
 	return parseResult(data, true)
 }
 
-func fetchRemoteResult(host, path, key string) *Result {
+func fetchRemoteResult(host, path, key string, targetOptions []string) *Result {
 	if host == "" || path == "" {
 		return &Result{State: "unset"}
 	}
@@ -337,6 +372,7 @@ func fetchRemoteResult(host, path, key string) *Result {
 		quoted, quoted, quoted,
 	)
 	args := []string{"ssh"}
+	args = append(args, targetOptions...)
 	if key != "" {
 		args = append(args, "-i", key)
 	}

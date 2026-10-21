@@ -1,0 +1,103 @@
+# ============================================================
+# Ferry project configuration template
+# Location: .ferry.yaml at the project root (nearest one found upward)
+# Commit this file together with scripts/.
+#
+# Node machine details should live in .private.ferry.yaml:
+#   - .private.ferry.yaml is always listed in .gitignore and is never synced
+#   - after every successful run, Ferry regenerates .ferry.yaml from it
+#   - the generated .ferry.yaml removes node definitions, so other users
+#     must fill them in before running
+#   - Ferry stops with a prompt when a node definition is missing
+#
+# If a .env file exists at the project root, Ferry loads it automatically and
+# injects its variables into all stage scripts. Never commit secrets.
+# ============================================================
+
+version: 1
+
+# project:
+#   name: demo        # default: directory name containing .ferry.yaml
+
+targets:
+  t507:  # target nickname; does not affect the build flow
+
+    # ---------------- sync ----------------
+    sync:
+      ignore:
+        - .git
+        - .ferry
+        - .private.ferry.yaml
+        - .env
+        - .venv
+        - __pycache__
+        - node_modules
+
+    # ---------------- dev node ----------------
+    # The host running Ferry is the dev node; no configuration is needed.
+    # dev:
+    #   node: ...
+
+    # ---------------- build node ----------------
+    build:
+      # Required. SSH Host alias, or an inline host alias.
+      # The inline form accepts the same keys as a ~/.ssh/config Host block.
+      # build.node must be defined explicitly; dev.node/build.node references
+      # are not allowed here.
+      node: buildvm
+      # node:
+      #   hostname: "localhost"
+      #   port: "12345"
+      #   user: "root"
+
+      # Required. Absolute writable path on the build node; all build-phase
+      # commands run with this as cwd.
+      workdir: "/work/demo"
+
+      # Required. Artifacts to transfer, relative to build.workdir.
+      # Directory -> recursively copy its contents; file -> copy the file;
+      # array -> copy each entry.
+      out: "./build/out"
+      # out: ["./build/a.out", "./build/b.lib"]
+
+      # Order: before_build -> sync code -> run_build -> after_build
+      # A single string is a shell command; an array is a list of script paths
+      # executed in order. before_build is optional.
+      before_build: "echo prepare to build"
+      # before_build: ["./scripts/build_phase_1.sh", "./scripts/build_phase_2.sh"]
+
+      # Required.
+      run_build: "echo building"
+
+      # Optional.
+      after_build: "echo build completed"
+
+    # ---------------- deploy node ----------------
+    deploy:
+      # Required. SSH Host alias, inline host alias, or node reference:
+      #   dev.node   -> run deploy phases on the dev machine
+      #   build.node -> run deploy phases on the build machine
+      node: board
+      # node: dev.node
+
+      # Optional. Artifact source: dev.node or build.node. Overrides the
+      # automatic topology decision. Ignored with a warning when deploy.node
+      # is dev.node/build.node.
+      # transfer_from: build.node
+
+      # Required. Absolute path on the deploy node; all deploy-phase commands
+      # run with this as cwd. When deploying on dev/build, Ferry checks that
+      # directories do not contain each other and warns.
+      workdir: /opt/app
+
+      # Order: before_deploy -> transfer artifacts -> run_deploy -> after_deploy
+      # A single string is a shell command; an array is a list of script paths
+      # executed in order. before_deploy is optional.
+      before_deploy: "echo prepare to deploy"
+      # before_deploy: ["./scripts/deploy_phase_1.sh"]
+
+      # Required.
+      run_deploy: "echo deploying"
+
+      # Optional.
+      after_deploy: "echo deploy completed"

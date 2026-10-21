@@ -1,7 +1,6 @@
 #!/bin/sh
 # Runs on the build node after the build command.
-# Strips shipped binaries with the cross strip tool when available.
-OUT="${XB_OUT:-build/out}"
+OUT="${OUT:-build/out}"
 STRIP="${CROSS_STRIP:-aarch64-linux-gnu-strip}"
 
 if ! command -v "$STRIP" >/dev/null 2>&1; then

@@ -10,6 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol
 
+from .nodes import NodeSpec
+
+Host = str | NodeSpec
+
+
+def _node(host: Host) -> NodeSpec:
+    if isinstance(host, NodeSpec):
+        return host
+    return NodeSpec(key=str(host), destination=str(host), role="build")
+
 
 class ExecError(Exception):
     pass
@@ -77,11 +87,11 @@ class Process:
 
 
 class Executor(Protocol):
-    def check(self, host: str) -> bool: ...
+    def check(self, host: Host) -> bool: ...
 
     def run(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
         timeout: float | None = None,
@@ -89,24 +99,25 @@ class Executor(Protocol):
 
     def spawn(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
     ) -> Process: ...
 
 
-def explain_ssh_failure(host: str, stderr: str) -> str:
+def explain_ssh_failure(host: Host, stderr: str) -> str:
+    name = host.display() if isinstance(host, NodeSpec) else str(host)
     lowered = stderr.lower()
     if "remote host identification has changed" in lowered:
         return (
-            f"host key for {host} changed (node was probably re-created). "
-            f"Review it with 'ssh-keygen -R {host}' and then rerun 'ferry up'."
+            f"host key for {name} changed (node was probably re-created). "
+            f"Review it with 'ssh-keygen -R {name}' and then rerun 'ferry up'."
         )
     if "permission denied" in lowered or "no supported authentication methods" in lowered:
-        return f"SSH authentication to {host} failed; check ~/.ssh/config and keys"
+        return f"SSH authentication to {name} failed; check ~/.ssh/config and keys"
     if "connection timed out" in lowered or "connection refused" in lowered:
-        return f"cannot reach {host} over SSH"
-    return f"SSH command on {host} failed: {stderr.strip() or 'unknown error'}"
+        return f"cannot reach {name} over SSH"
+    return f"SSH command on {name} failed: {stderr.strip() or 'unknown error'}"
 
 
 class SshExecutor:
@@ -125,10 +136,15 @@ class SshExecutor:
         self.default_password = default_password
         self.identity = identity
 
-    def password_for(self, host: str) -> str | None:
-        return self.passwords.get(host, self.default_password)
+    def password_for(self, host: Host) -> str | None:
+        node = _node(host)
+        for key in (node.key, node.destination, node.role):
+            if key and key in self.passwords:
+                return self.passwords[key]
+        return self.default_password
 
-    def options(self, host: str) -> list[str]:
+    def options(self, host: Host) -> list[str]:
+        node = _node(host)
         opts = [
             "-o",
             f"ConnectTimeout={self.connect_timeout}",
@@ -141,6 +157,7 @@ class SshExecutor:
         opts.extend(["-o", f"StrictHostKeyChecking={policy}"])
         if self.identity:
             opts.extend(["-i", self.identity])
+        opts.extend(node.ssh_options())
         if self.password_for(host):
             opts.extend(
                 [
@@ -156,7 +173,7 @@ class SshExecutor:
             opts.extend(["-o", "BatchMode=yes"])
         return opts
 
-    def environment(self, host: str) -> dict[str, str] | None:
+    def environment(self, host: Host) -> dict[str, str] | None:
         password = self.password_for(host)
         if not password:
             return None
@@ -177,12 +194,13 @@ class SshExecutor:
         )
         return env
 
-    def _command(self, host: str, argv: list[str]) -> list[str]:
+    def _command(self, host: Host, argv: list[str]) -> list[str]:
         if not argv:
             raise ExecError("empty remote command")
-        return ["ssh", *self.options(host), host, shlex.join(argv)]
+        node = _node(host)
+        return ["ssh", *self.options(host), node.destination, shlex.join(argv)]
 
-    def check(self, host: str) -> bool:
+    def check(self, host: Host) -> bool:
         try:
             result = self.run(host, ["true"], timeout=self.connect_timeout + 2)
         except (ExecError, OSError):
@@ -191,7 +209,7 @@ class SshExecutor:
 
     def run(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
         timeout: float | None = None,
@@ -205,14 +223,17 @@ class SshExecutor:
                 env=self.environment(host),
             )
         except subprocess.TimeoutExpired as exc:
-            raise CommandTimeout(f"command on {host} timed out: {argv[0]}") from exc
+            display = _node(host).display()
+            raise CommandTimeout(
+                f"command on {display} timed out: {argv[0]}"
+            ) from exc
         except OSError as exc:
             raise ExecError(f"failed to invoke ssh: {exc}") from exc
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
     def spawn(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
     ) -> Process:
@@ -225,7 +246,7 @@ class SshExecutor:
             bufsize=0,
             env=self.environment(host),
         )
-        process = Process(popen, f"{argv[0]} on {host}")
+        process = Process(popen, f"{argv[0]} on {_node(host).display()}")
         if stdin is not None:
             process.send(stdin)
             process.close_stdin()
@@ -236,12 +257,12 @@ class LocalExecutor:
     def __init__(self, shell: str | None = None) -> None:
         self.shell = shell
 
-    def check(self, host: str) -> bool:
+    def check(self, host: Host) -> bool:
         return True
 
     def run(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
         timeout: float | None = None,
@@ -261,7 +282,7 @@ class LocalExecutor:
 
     def spawn(
         self,
-        host: str,
+        host: Host,
         argv: list[str],
         stdin: bytes | None = None,
     ) -> Process:
@@ -281,7 +302,7 @@ class LocalExecutor:
 
 def remote_mkdir_and_upload(
     executor: Executor,
-    host: str,
+    host: Host,
     remote_path: str,
     data: bytes,
 ) -> None:
@@ -298,6 +319,18 @@ def remote_mkdir_and_upload(
 
 def quote_remote(value: str) -> str:
     return shlex.quote(value)
+
+
+def resolve_remote_ferry_key(executor: Executor, host: Host) -> str | None:
+    script = (
+        'f="$HOME/.ferry/keys/id_ed25519"; '
+        'if [ -f "$f" ]; then printf %s "$f"; fi'
+    )
+    result = executor.run(host, ["sh", "-c", script], timeout=15)
+    if result.returncode != 0:
+        return None
+    value = result.stdout_text.strip()
+    return value or None
 
 
 def shell_join(argv: list[str]) -> str:
