@@ -123,3 +123,52 @@ def test_up_supports_inline_nodes(tmp_path: Path, monkeypatch) -> None:
     build_node = private_data["targets"]["local"]["build"]["node"]
     assert build_node["hostname"] == "localhost"
     assert build_node["port"] == "2222"
+
+
+def test_up_local_skips_probe_and_keeps_symbolic_nodes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("ferry.commands.up.SshExecutor", FakeExecutor)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "ferry.commands.up.ensure_remote_probe",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    monkeypatch.setattr(
+        "ferry.commands.up.resolve_credentials", lambda **kwargs: Credentials()
+    )
+
+    up_command.up(
+        ssh="dev.node",
+        build_host=None,
+        build_user=None,
+        build_port=None,
+        target="dev.node",
+        target_host=None,
+        target_user=None,
+        target_port=None,
+        name="local",
+        build_workdir=".",
+        out=["./dist"],
+        run_build="make",
+        run_deploy="true",
+        deploy_workdir="./deploy",
+        transfer_from=None,
+        before_build=None,
+        after_build=None,
+        before_deploy=None,
+        after_deploy=None,
+        yes=True,
+        reset=False,
+        ask_pass=False,
+    )
+
+    assert calls == []
+    public = yaml.safe_load(
+        (tmp_path / ".ferry.yaml").read_text(encoding="utf-8")
+    )
+    target = public["targets"]["local"]
+    assert target["build"]["node"] == "dev.node"
+    assert target["deploy"]["node"] == "dev.node"
+    assert (tmp_path / "deploy").is_dir()

@@ -176,7 +176,6 @@ class Pipeline:
 
         build_key: str | None = None
         if resolved.build_is_local:
-            probe: Probe = LocalProbe()
             if resolved.deploy_role == "dev":
                 route = Route(
                     name="dev->dev",
@@ -249,6 +248,7 @@ class Pipeline:
                 self.console.print(
                     f"[yellow]notice:[/yellow] added to .gitignore: {', '.join(added)}"
                 )
+        probe: Probe
         if resolved.build_is_local:
             probe = LocalProbe()
         else:
