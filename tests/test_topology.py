@@ -113,7 +113,7 @@ def test_check_build_to_target_uses_inline_options() -> None:
 def test_build_cannot_be_a_reference() -> None:
     with pytest.raises(ValidationError):
         BuildCfg(
-            node="dev.node",
+            node="build.node",
             workdir="/work",
             out="./dist",
             run_build="true",

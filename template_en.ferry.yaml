@@ -6,9 +6,12 @@
 # Node machine details should live in .private.ferry.yaml:
 #   - .private.ferry.yaml is always listed in .gitignore and is never synced
 #   - after every successful run, Ferry regenerates .ferry.yaml from it
-#   - the generated .ferry.yaml removes node definitions, so other users
-#     must fill them in before running
-#   - Ferry stops with a prompt when a node definition is missing
+#   - the generated file removes concrete aliases/inline nodes but keeps
+#     symbolic references such as dev.node/build.node; other users fill in
+#     the concrete nodes before running
+#   - Ferry stops with a prompt when a concrete node definition is missing
+#   - for single-machine development set build.node: dev.node and
+#     deploy.node: dev.node; no SSH, probe, or remote Linux is required
 #
 # If a .env file exists at the project root, Ferry loads it automatically and
 # injects its variables into all stage scripts. Never commit secrets.
@@ -40,18 +43,21 @@ targets:
 
     # ---------------- build node ----------------
     build:
-      # Required. SSH Host alias, or an inline host alias.
+      # Required. SSH Host alias, inline host alias, or dev.node.
       # The inline form accepts the same keys as a ~/.ssh/config Host block.
-      # build.node must be defined explicitly; dev.node/build.node references
-      # are not allowed here.
+      # build.node cannot be build.node.
       node: buildvm
+      # node: dev.node          # single-machine mode: build locally
       # node:
       #   hostname: "localhost"
       #   port: "12345"
       #   user: "root"
 
-      # Required. Absolute writable path on the build node; all build-phase
-      # commands run with this as cwd.
+      # Required. All build-phase commands run with this as cwd.
+      # Remote nodes require an absolute POSIX path; dev.node may use a path
+      # relative to the project root, such as "." or "./buildroot".
+      # When local and equal to the project root, Ferry builds in place and
+      # skips sync; otherwise it copies the workspace locally first.
       workdir: "/work/demo"
 
       # Required. Artifacts to transfer, relative to build.workdir.
@@ -82,12 +88,14 @@ targets:
 
       # Optional. Artifact source: dev.node or build.node. Overrides the
       # automatic topology decision. Ignored with a warning when deploy.node
-      # is dev.node/build.node.
+      # is dev.node/build.node, or when build.node is dev.node.
       # transfer_from: build.node
 
-      # Required. Absolute path on the deploy node; all deploy-phase commands
-      # run with this as cwd. When deploying on dev/build, Ferry checks that
-      # directories do not contain each other and warns.
+      # Required. All deploy-phase commands run with this as cwd.
+      # Remote nodes require an absolute POSIX path; dev.node may use a path
+      # relative to the project root. If build.node is dev.node and deploy.node
+      # is build.node, deploy also runs locally. When deploying on dev/build,
+      # Ferry checks that directories do not contain each other and warns.
       workdir: /opt/app
 
       # Order: before_deploy -> transfer artifacts -> run_deploy -> after_deploy

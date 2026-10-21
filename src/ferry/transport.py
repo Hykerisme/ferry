@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import posixpath
 import shlex
+import shutil
 import tarfile
 import uuid
 from collections.abc import Iterable
@@ -90,6 +91,32 @@ def write_tar(stream: IO[bytes], root: Path, patterns: list[str]) -> int:
     return count
 
 
+def _add_tar_path(tar: tarfile.TarFile, path: Path, arcname: str) -> None:
+    info = _normalized_info(tar, path, arcname)
+    if info.isreg():
+        with path.open("rb") as handle:
+            tar.addfile(info, handle)
+    elif info.isdir():
+        tar.addfile(info)
+        for child in sorted(path.iterdir()):
+            _add_tar_path(tar, child, f"{arcname}/{child.name}")
+    elif info.issym() or info.islnk():
+        tar.addfile(info)
+
+
+def write_tar_paths(
+    stream: IO[bytes], root: Path, paths: list[str] | None = None
+) -> None:
+    """Write a tar stream: directory contents (paths=None) or selected entries."""
+    with tarfile.open(fileobj=stream, mode="w|") as tar:
+        if paths is None:
+            for child in sorted(root.iterdir()):
+                _add_tar_path(tar, child, child.name)
+            return
+        for relative in paths:
+            _add_tar_path(tar, root / relative, relative)
+
+
 def upload_tree(
     executor: Executor,
     host: Host,
@@ -138,6 +165,50 @@ def safe_extract(stream: IO[bytes], destination: Path) -> int:
                 target.write_bytes(source.read())
             count += 1
     return count
+
+
+def copy_tree_local(root: Path, dest: Path, patterns: list[str]) -> int:
+    """Copy the workspace to a local directory without deleting extra files."""
+    dest.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest.resolve()
+    root_resolved = root.resolve()
+    skip: str | None = None
+    try:
+        skip = dest_resolved.relative_to(root_resolved).as_posix()
+    except ValueError:
+        pass
+    count = 0
+    for path, rel in _iter_entries(root, patterns):
+        if skip is not None and (rel == skip or rel.startswith(skip + "/")):
+            continue
+        target = dest / rel
+        if path.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.symlink_to(path.readlink())
+        elif path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif path.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        count += 1
+    return count
+
+
+def copy_artifact_local(source: str, is_dir: bool, deploy_workdir: str) -> None:
+    src = Path(source)
+    dest = Path(deploy_workdir)
+    dest.mkdir(parents=True, exist_ok=True)
+    if is_dir:
+        if src.resolve() == dest.resolve():
+            return
+        shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
+        return
+    target = dest / src.name
+    if target.resolve() == src.resolve():
+        return
+    shutil.copy2(src, target)
 
 
 @dataclass

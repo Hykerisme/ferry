@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -53,10 +55,11 @@ def test_inline_node_options() -> None:
     assert "IdentityFile=/keys/id" in options
 
 
-def test_deploy_dev_reference() -> None:
-    resolved = resolve_target(make_target(deploy_node="dev.node"))
+def test_deploy_dev_reference(tmp_path: Path) -> None:
+    resolved = resolve_target(make_target(deploy_node="dev.node"), tmp_path)
     assert resolved.deploy_role == "dev"
     assert resolved.deploy.is_local
+    assert resolved.deploy_workdir.endswith("/opt/app")
 
 
 def test_deploy_build_reference_reuses_build_spec() -> None:

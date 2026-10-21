@@ -35,6 +35,20 @@ def test_init_refuses_to_overwrite(tmp_path: Path, monkeypatch) -> None:
     assert "already exists" in result.output
 
 
+def test_init_local_creates_runnable_target(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "--local"])
+    assert result.exit_code == 0, result.output
+    config = yaml.safe_load((tmp_path / ".ferry.yaml").read_text(encoding="utf-8"))
+    target = config["targets"]["local"]
+    assert target["build"]["node"] == "dev.node"
+    assert target["build"]["workdir"] == "."
+    assert target["deploy"]["node"] == "dev.node"
+    assert target["deploy"]["workdir"] == "./deploy"
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert ".ferry/" in gitignore
+
+
 def test_status_without_config_fails(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["status"])

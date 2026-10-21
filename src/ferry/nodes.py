@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
-from .config import (
-    InlineNode,
-    NodeConfigMissing,
-    TargetCfg,
-)
+from .config import InlineNode, NodeConfigMissing, TargetCfg
 
 Role = Literal["dev", "build", "deploy"]
 DeployRole = Literal["external", "dev", "build"]
@@ -49,6 +46,9 @@ class ResolvedTarget:
     deploy_role: DeployRole
     transfer_from: TransferFrom | None = None
     warnings: tuple[str, ...] = ()
+    build_is_local: bool = False
+    build_workdir: str = ""
+    deploy_workdir: str = ""
 
 
 def _alias_spec(alias: str, role: Role) -> NodeSpec:
@@ -96,7 +96,14 @@ def _spec(node: str | InlineNode, role: Role) -> NodeSpec:
     return _inline_spec(node, role)
 
 
-def resolve_target(target: TargetCfg) -> ResolvedTarget:
+def _local_workdir(root: Path, value: str) -> str:
+    path = Path(value)
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve().as_posix()
+
+
+def resolve_target(target: TargetCfg, root: Path | None = None) -> ResolvedTarget:
     if target.build.node is None:
         raise NodeConfigMissing(
             "missing build.node; run 'ferry up' or add it to .private.ferry.yaml"
@@ -105,7 +112,19 @@ def resolve_target(target: TargetCfg) -> ResolvedTarget:
         raise NodeConfigMissing(
             "missing deploy.node; run 'ferry up' or add it to .private.ferry.yaml"
         )
-    build = _spec(target.build.node, "build")
+
+    build_is_local = isinstance(target.build.node, str) and target.build.node == "dev.node"
+    if build_is_local:
+        if root is None:
+            raise NodeConfigMissing(
+                "project root is required to resolve a local build workdir"
+            )
+        build = NodeSpec(key="dev.node", destination="", role="dev")
+        build_workdir = _local_workdir(root, target.build.workdir)
+    else:
+        build = _spec(target.build.node, "build")
+        build_workdir = target.build.workdir
+
     warnings: list[str] = []
     deploy_role: DeployRole = "external"
     transfer_from: TransferFrom | None = None
@@ -115,22 +134,42 @@ def resolve_target(target: TargetCfg) -> ResolvedTarget:
         deploy = NodeSpec(key="dev.node", destination="", role="dev")
         deploy_role = "dev"
     elif isinstance(raw_deploy, str) and raw_deploy == "build.node":
-        deploy = NodeSpec(
-            key=build.key,
-            destination=build.destination,
-            role="build",
-            user=build.user,
-            port=build.port,
-            options=build.options,
-        )
-        deploy_role = "build"
+        if build_is_local:
+            deploy = NodeSpec(key="dev.node", destination="", role="dev")
+            deploy_role = "dev"
+            warnings.append(
+                "deploy.node=build.node but build.node is dev.node; deploying locally"
+            )
+        else:
+            deploy = NodeSpec(
+                key=build.key,
+                destination=build.destination,
+                role="build",
+                user=build.user,
+                port=build.port,
+                options=build.options,
+            )
+            deploy_role = "build"
     else:
         deploy = _spec(raw_deploy, "deploy")
+
+    if deploy.is_local:
+        if root is None:
+            raise NodeConfigMissing(
+                "project root is required to resolve a local deploy workdir"
+            )
+        deploy_workdir = _local_workdir(root, target.deploy.workdir)
+    else:
+        deploy_workdir = target.deploy.workdir
 
     requested = target.deploy.transfer_from
     if requested is not None:
         mapped: TransferFrom = "build" if requested == "build.node" else "dev"
-        if deploy_role != "external":
+        if build_is_local:
+            warnings.append(
+                "build.node is dev.node; transfer_from has no effect in local mode"
+            )
+        elif deploy_role != "external":
             warnings.append(
                 f"deploy.node is {raw_deploy}; transfer_from={requested} is ignored"
             )
@@ -142,4 +181,7 @@ def resolve_target(target: TargetCfg) -> ResolvedTarget:
         deploy_role=deploy_role,
         transfer_from=transfer_from,
         warnings=tuple(warnings),
+        build_is_local=build_is_local,
+        build_workdir=build_workdir,
+        deploy_workdir=deploy_workdir,
     )

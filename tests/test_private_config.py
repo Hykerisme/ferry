@@ -33,8 +33,45 @@ def test_regenerate_public_strips_nodes_and_keeps_comments(tmp_path: Path) -> No
     assert "# top comment" in text
     assert "keep this comment" in text
     assert "node:" not in text
-    assert "transfer_from" not in text
+    assert "transfer_from: build.node" in text
     assert "run_build: make" in text
+
+
+def test_regenerate_public_keeps_symbolic_node_refs(tmp_path: Path) -> None:
+    private = tmp_path / ".private.ferry.yaml"
+    public = tmp_path / ".ferry.yaml"
+    private.write_text(
+        """version: 1
+targets:
+  local:
+    build:
+      node: dev.node
+      workdir: .
+      out: ./dist
+      run_build: make
+    deploy:
+      node: build.node
+      workdir: ./deploy
+      run_deploy: echo deploy
+  remote:
+    build:
+      node: buildvm
+      workdir: /work/app
+      out: ./dist
+      run_build: make
+    deploy:
+      node: board
+      workdir: /opt/app
+      run_deploy: echo deploy
+""",
+        encoding="utf-8",
+    )
+    regenerate_public(private, public)
+    text = public.read_text(encoding="utf-8")
+    assert "node: dev.node" in text
+    assert "node: build.node" in text
+    assert "buildvm" not in text
+    assert "board" not in text
 
 
 def test_ensure_gitignore_adds_private_and_env(tmp_path: Path) -> None:

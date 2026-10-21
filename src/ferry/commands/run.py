@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+
 import typer
 from rich.console import Console
 
@@ -12,6 +16,16 @@ from ..probe import ProbeError, cancel_remote
 from ..state import load_state
 
 console = Console()
+
+
+def _cancel_local(pid: int) -> None:
+    if os.name == "nt":  # pragma: no cover - platform branch
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+        )
+        return
+    os.kill(pid, signal.SIGINT)
 
 
 def run(
@@ -41,10 +55,19 @@ def run(
             raise typer.Exit(1)
         try:
             target_cfg = loaded.config.targets[target]
-            resolved = resolve_target(target_cfg)
+            resolved = resolve_target(target_cfg, loaded.root)
         except (KeyError, NodeConfigMissing) as exc:
             console.print(f"[red]cannot resolve build node:[/red] {exc}")
             raise typer.Exit(1) from exc
+        pids = sorted({pid for pid in (state.probe_pid, state.lock_pid) if pid})
+        if resolved.build_is_local:
+            for pid in pids:
+                _cancel_local(pid)
+            console.print(
+                f"sent cancel signal to local run pids {pids}; "
+                "the build gets a grace period"
+            )
+            return
         credentials = resolve_credentials(ask=ask_pass, need_target=False)
         passwords = (
             {"build": credentials.build_password}
@@ -52,7 +75,6 @@ def run(
             else None
         )
         executor = SshExecutor(passwords=passwords)
-        pids = [pid for pid in (state.probe_pid, state.lock_pid) if pid]
         cancel_remote(executor, resolved.build, pids)
         console.print(
             f"sent SIGTERM to pids {pids} on {resolved.build.display()}; "
@@ -66,7 +88,7 @@ def run(
             loaded, target, console=console, credentials=credentials
         )
         ctx = pipeline.prepare(refresh_topology=refresh_topology, reset_probe=reset_probe)
-        steps = pipeline.build_steps()
+        steps = pipeline.build_steps(ctx)
         pipeline.execute(ctx, steps)
     except (PipelineError, ProbeError, ExecError) as exc:
         console.print(f"[red]run failed:[/red] {exc}")

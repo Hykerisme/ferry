@@ -6,8 +6,11 @@
 # 节点机器信息建议放在 .private.ferry.yaml：
 #   - .private.ferry.yaml 始终加入 .gitignore，不会被同步到构建机
 #   - 每次 run 成功后，Ferry 会根据它重新生成 .ferry.yaml
-#   - 生成的 .ferry.yaml 会移除 node 定义，其他人使用时必须自行填写
-#   - 缺少 node 定义时，Ferry 会中断并提示用户
+#   - 生成的 .ferry.yaml 只移除具体别名/inline 节点，保留 dev.node/build.node
+#     这类不含机器信息的符号引用；其他人使用时需自行补全具体节点
+#   - 缺少具体 node 定义时，Ferry 会中断并提示用户
+#   - 单机开发可设 build.node: dev.node 与 deploy.node: dev.node，
+#     不需要 SSH、探针或远端 Linux
 #
 # 如果项目根目录存在 .env，Ferry 会自动加载并注入所有阶段脚本。
 # 不要把密码或 token 提交到 git。
@@ -39,16 +42,20 @@ targets:
 
     # ---------------- 构建节点 ----------------
     build:
-      # 必填。SSH Host 别名，或 inline host alias。
+      # 必填。SSH Host 别名、inline host alias，或 dev.node。
       # inline 写法支持与 ~/.ssh/config 的 Host 块相同的字段。
-      # build.node 必须显式定义，不能引用 dev.node/build.node。
+      # build.node 不能写 build.node。
       node: buildvm
+      # node: dev.node          # 单机模式：在本机构建
       # node:
       #   hostname: "localhost"
       #   port: "12345"
       #   user: "root"
 
-      # 必填。构建机上的绝对可写路径；所有 build 阶段命令以它为 cwd。
+      # 必填。所有 build 阶段命令以它为 cwd。
+      # 远程节点必须是 POSIX 绝对路径；
+      # dev.node 可写相对路径（相对项目根），例如 "." 或 "./buildroot"。
+      # 本地且 workdir 等于项目根时原地构建并跳过 sync；否则先本地复制。
       workdir: "/work/demo"
 
       # 必填。要传输的产物，路径相对 build.workdir。
@@ -77,10 +84,13 @@ targets:
       # node: dev.node
 
       # 可选。产物来源：dev.node 或 build.node，覆盖自动拓扑判断。
-      # 当 deploy.node 为 dev.node/build.node 时，此项被忽略并警告。
+      # 当 deploy.node 为 dev.node/build.node 时忽略并警告；
+      # build.node 为 dev.node 时本地构建，该项无意义并警告。
       # transfer_from: build.node
 
-      # 必填。目标机上的绝对路径；所有 deploy 阶段命令以它为 cwd。
+      # 必填。所有 deploy 阶段命令以它为 cwd。
+      # 远程节点必须是 POSIX 绝对路径；dev.node 可写相对路径（相对项目根）。
+      # build.node 为 dev.node 且 deploy.node: build.node 时，部署也在本地执行。
       # 在 dev/build 上执行时，会检查目录是否互相包含并警告。
       workdir: /opt/app
 

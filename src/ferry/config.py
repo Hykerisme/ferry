@@ -52,6 +52,22 @@ def _validate_workdir(value: str) -> str:
     return value
 
 
+def _require_posix_absolute(value: str) -> str:
+    normalized = _validate_workdir(value)
+    if not normalized.startswith("/"):
+        raise ValueError("must be an absolute POSIX path")
+    return normalized
+
+
+def _validate_local_workdir(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    if not normalized:
+        raise ValueError("must not be empty")
+    if ".." in PurePosixPath(normalized).parts:
+        raise ValueError("must not contain '..'")
+    return normalized
+
+
 def _validate_relative_path(value: str) -> str:
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -137,17 +153,17 @@ class BuildCfg(StrictModel):
     @field_validator("node")
     @classmethod
     def _node(cls, value: str | InlineNode | None) -> str | InlineNode | None:
-        if isinstance(value, str) and value in {"dev.node", "build.node"}:
-            raise ValueError("build.node must be a concrete alias or inline host alias")
+        if isinstance(value, str) and value == "build.node":
+            raise ValueError("build.node must be a concrete alias, inline host alias, or dev.node")
         return value
 
-    @field_validator("workdir")
-    @classmethod
-    def _workdir(cls, value: str) -> str:
-        normalized = _validate_workdir(value)
-        if not normalized.startswith("/"):
-            raise ValueError("build.workdir must be an absolute POSIX path")
-        return normalized
+    @model_validator(mode="after")
+    def _workdir_for_node(self) -> BuildCfg:
+        if self.node is None or self.node == "dev.node":
+            self.workdir = _validate_local_workdir(self.workdir)
+        else:
+            self.workdir = _require_posix_absolute(self.workdir)
+        return self
 
     @field_validator("out")
     @classmethod
@@ -172,10 +188,17 @@ class DeployCfg(StrictModel):
     run_deploy: CommandSpec
     after_deploy: CommandSpec | None = None
 
-    @field_validator("workdir")
-    @classmethod
-    def _workdir(cls, value: str) -> str:
-        return _validate_workdir(value)
+    @model_validator(mode="after")
+    def _workdir_for_node(self) -> DeployCfg:
+        if self.node is None or self.node == "dev.node":
+            self.workdir = _validate_local_workdir(self.workdir)
+        elif self.node == "build.node":
+            # Whether this must be absolute depends on build.node; TargetCfg
+            # performs the final check.
+            self.workdir = _validate_local_workdir(self.workdir)
+        else:
+            self.workdir = _require_posix_absolute(self.workdir)
+        return self
 
     @field_validator("before_deploy", "run_deploy", "after_deploy", mode="before")
     @classmethod
@@ -187,6 +210,15 @@ class TargetCfg(StrictModel):
     sync: SyncCfg = Field(default_factory=SyncCfg)
     build: BuildCfg
     deploy: DeployCfg
+
+    @model_validator(mode="after")
+    def _validate_deploy_on_build(self) -> TargetCfg:
+        if self.deploy.node == "build.node":
+            if self.build.node == "dev.node":
+                self.deploy.workdir = _validate_local_workdir(self.deploy.workdir)
+            else:
+                self.deploy.workdir = _require_posix_absolute(self.deploy.workdir)
+        return self
 
 
 class ProjectCfg(StrictModel):

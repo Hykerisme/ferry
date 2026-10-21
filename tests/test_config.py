@@ -97,13 +97,13 @@ def test_windows_workdir_is_accepted(tmp_path: Path) -> None:
     }
     write_config(tmp_path, {"targets": {"b": target}})
     loaded = load_config(tmp_path)
-    assert loaded.config.targets["b"].deploy.workdir == r"C:\deploy\app"
+    assert loaded.config.targets["b"].deploy.workdir == "C:/deploy/app"
 
 
 def test_build_node_cannot_be_a_reference(tmp_path: Path) -> None:
     target = dict(VALID["targets"]["board"])  # type: ignore[index]
     target["build"] = {
-        "node": "dev.node",
+        "node": "build.node",
         "workdir": "/work",
         "out": "./dist",
         "run_build": "true",
@@ -119,6 +119,38 @@ def test_deploy_node_accepts_references(tmp_path: Path) -> None:
     write_config(tmp_path, {"targets": {"b": target}})
     loaded = load_config(tmp_path)
     assert loaded.config.targets["b"].deploy.node == "dev.node"
+
+
+def test_local_build_allows_relative_workdir(tmp_path: Path) -> None:
+    target = dict(VALID["targets"]["board"])  # type: ignore[index]
+    target["build"] = {
+        "node": "dev.node",
+        "workdir": ".",
+        "out": "./dist",
+        "run_build": "true",
+    }
+    target["deploy"] = {
+        "node": "dev.node",
+        "workdir": "./deploy",
+        "run_deploy": "true",
+    }
+    write_config(tmp_path, {"targets": {"b": target}})
+    loaded = load_config(tmp_path)
+    assert loaded.config.targets["b"].build.workdir == "."
+    assert loaded.config.targets["b"].deploy.workdir == "./deploy"
+
+
+def test_local_workdir_rejects_parent_traversal(tmp_path: Path) -> None:
+    target = dict(VALID["targets"]["board"])  # type: ignore[index]
+    target["build"] = {
+        "node": "dev.node",
+        "workdir": "../outside",
+        "out": "./dist",
+        "run_build": "true",
+    }
+    write_config(tmp_path, {"targets": {"b": target}})
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
 
 
 def test_inline_node_accepts_ssh_host_keys(tmp_path: Path) -> None:

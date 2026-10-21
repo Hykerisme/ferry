@@ -26,3 +26,18 @@ def test_no_passwords(monkeypatch) -> None:
     monkeypatch.delenv("FERRY_TARGET_PASSWORD", raising=False)
     credentials = resolve_credentials(ask=False)
     assert not credentials.has_any
+
+
+def test_prompts_can_be_disabled_per_role(monkeypatch) -> None:
+    monkeypatch.delenv("FERRY_SSH_PASSWORD", raising=False)
+    monkeypatch.delenv("FERRY_BUILD_PASSWORD", raising=False)
+    monkeypatch.delenv("FERRY_TARGET_PASSWORD", raising=False)
+
+    def fail(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("should not prompt")
+
+    monkeypatch.setattr("ferry.auth.getpass.getpass", fail)
+    credentials = resolve_credentials(
+        ask=True, need_build=False, need_target=False
+    )
+    assert not credentials.has_any

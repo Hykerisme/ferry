@@ -7,6 +7,7 @@
 
 ```text
 ferry init      → 生成项目配置与 .gitignore
+ferry init --local → 生成可直接 run 的单机 target
 ferry up        → 填写节点、校验、安装探针，写 private/public 配置
 ferry plan      → 预览这次会做什么
 ferry run       → 同步 → 构建 → 传输 → 部署
@@ -39,8 +40,8 @@ ferry --help
 
 | 命令 | 什么时候用 | 是否改远端 |
 | --- | --- | --- |
-| `ferry init` | 新项目第一次接入 | 否 |
-| `ferry up` | 新增/更换构建机或部署机 | 是（探针、可选密钥） |
+| `ferry init` | 新项目第一次接入（`--local` 单机模式） | 否 |
+| `ferry up` | 新增/更换构建机或部署机 | 是（探针、可选密钥；本地模式跳过） |
 | `ferry plan <target>` | 跑之前确认步骤和路由 | 只读探测 |
 | `ferry run <target>` | 日常同步、构建、部署 | 是 |
 | `ferry status [target]` | 查看最近一次运行状态 | 否 |
@@ -55,9 +56,12 @@ ferry --help
 ```bash
 ferry init
 ferry init --force        # 覆盖已有 .ferry.yaml（打印 diff）
+ferry init --local        # 生成 target: local，本机 build + deploy
 ```
 
-- 生成的 `.ferry.yaml` 只有 `version/project/targets`，`targets` 为空。
+- 默认生成的 `.ferry.yaml` 只有 `version/project/targets`，`targets` 为空。
+- `--local` 会生成可运行的 `local` target：`build.node: dev.node`、`workdir: .`、`deploy.node: dev.node`、`deploy.workdir: ./deploy`；根据 CMake/Makefile 猜测 `run_build`。
+- `--local` 同时把 `.ferry/`、`deploy/` 加入 `.gitignore`。
 - 节点信息通过 `ferry up` 填写，或手动编辑 `.private.ferry.yaml`。
 
 ---
@@ -67,8 +71,9 @@ ferry init --force        # 覆盖已有 .ferry.yaml（打印 diff）
 填写节点、校验 SSH 与目录、安装探针，然后：
 
 - 写 `.private.ferry.yaml`（真实节点配置，gitignore、不同步）；
-- 生成 `.ferry.yaml`（移除 `node` / `transfer_from`，其余内容与注释保留）；
-- 其他人拿到没有节点的 `.ferry.yaml` 时，`run/plan` 会中断并提示补节点。
+- 生成 `.ferry.yaml`（只移除具体别名/inline 节点，保留 `dev.node` / `build.node` 符号引用，其余内容与注释保留）；
+- 其他人拿到没有具体节点的 `.ferry.yaml` 时，`run/plan` 会中断并提示补节点。
+- 本地构建（`build.node: dev.node`）不检查 SSH、不安装探针；全本地 target 不询问密码。
 
 ```bash
 ferry up
@@ -83,12 +88,12 @@ ferry up --build-host 192.168.1.10 --build-user dev --build-port 2222 ...
 | `--target <别名/引用>` | 部署节点别名，或 `dev.node` / `build.node` |
 | `--target-host/--target-user/--target-port` | 部署节点 inline host alias |
 | `--name <别名>` | target 名称，默认 `default` |
-| `--build-workdir <路径>` | 构建机绝对可写路径（必须 POSIX 绝对路径） |
+| `--build-workdir <路径>` | 构建目录；远程必须 POSIX 绝对路径，`dev.node` 可相对项目根 |
 | `--out <路径>` | 产物路径，相对 `build.workdir`；可重复 |
 | `--run-build <命令>` | 构建命令（必填） |
 | `--run-deploy <命令>` | 部署命令（必填） |
-| `--deploy-workdir <路径>` | 部署节点绝对路径 |
-| `--transfer-from <引用>` | `build.node`（直推）或 `dev.node`（经 dev 中转） |
+| `--deploy-workdir <路径>` | 部署目录；远程必须绝对路径，本地可相对 |
+| `--transfer-from <引用>` | `build.node`（直推）或 `dev.node`（经 dev 中转）；本地构建时忽略 |
 | `--before-build/--after-build/--before-deploy/--after-deploy` | 可选命令 |
 | `--yes`, `-y` | 不再确认写配置 |
 | `--reset` | 重新上传探针 |
@@ -100,7 +105,7 @@ ferry up --build-host 192.168.1.10 --build-user dev --build-port 2222 ...
 
 ## `ferry plan <target>`
 
-Dry-run：打印节点、路由、`.env` 变量（值用 `***`）和完整步骤，不执行同步/构建/部署。
+Dry-run：打印节点、解析后的 build/deploy 目录、路由、`.env` 变量（值用 `***`）和完整步骤，不执行同步/构建/部署。本地原地构建会显示 `[sync] skipped`。
 
 ```bash
 ferry plan t507
@@ -122,7 +127,7 @@ ferry run t507 --cancel
 
 | 参数 | 说明 |
 | --- | --- |
-| `--cancel` | 对正在运行的构建发 SIGTERM，15 秒宽限后 SIGKILL |
+| `--cancel` | 远程构建发 SIGTERM，15 秒宽限后 SIGKILL；本地 POSIX 发 SIGINT，Windows 用 taskkill |
 | `--refresh-topology` | 忽略拓扑缓存 |
 | `--reset-probe` | 重新上传探针 |
 | `--ask-pass` | 交互输入密码（同一次运行内复用） |
@@ -164,8 +169,10 @@ ferry topology t507 --refresh
 
 - `build -> target`：构建机直接推部署节点。
 - `build -> dev -> target`：构建机到不了部署节点，或使用目标机密码；产物与 deploy 脚本经开发机中转。
+- `dev -> target`：本地构建（`build.node: dev.node`），产物从开发机直接推送。
+- `dev -> dev`：本地构建 + 本地部署，不进行 SSH 探测。
 - `deploy.node: dev.node`：产物拉回开发机，deploy 阶段在本地执行。
-- `deploy.node: build.node`：deploy 阶段在构建机执行，产物就地复制。
+- `deploy.node: build.node`：deploy 阶段在构建机执行，产物就地复制；构建也是本地时归一化为本地部署。
 
 ---
 
@@ -217,8 +224,10 @@ targets:
 
 - 字符串：`~/.ssh/config` Host 别名。
 - 映射：inline host alias，字段与 Host 块一致（`hostname`、`user`、`port`、`IdentityFile`、`ProxyJump` 等）。
-- `build.node` 必须是具体节点，不能写 `dev.node` / `build.node`。
+- `build.node` 必须是具体节点或 `dev.node`；不能写 `build.node`。
 - `deploy.node` 额外支持 `dev.node` 和 `build.node`。
+- 远程节点 `workdir` 必须是 POSIX 绝对路径；`dev.node` 可写相对项目根的路径。
+- `build.node: dev.node` 且 `workdir` 等于项目根时原地构建、跳过 sync；否则先复制到本地 workdir。
 
 ### `transfer_from`
 
@@ -226,11 +235,12 @@ targets:
 - `dev.node`：先拉回开发机，再由开发机推送。
 - 只选择传输路径，不改变产物来源；产物始终来自 build。
 - `deploy.node` 是本地引用时忽略并警告。
+- 本地构建（`build.node: dev.node`）时忽略并警告。
 
 ### 私有配置与 `.env`
 
 - `.private.ferry.yaml`：本机真实节点配置，始终 gitignore、绝不同步。
-- 成功 run 后自动生成 `.ferry.yaml`，移除节点定义；其他内容与注释保留。
+- 成功 run 后自动生成 `.ferry.yaml`，只移除具体别名/inline 节点，保留 `dev.node` / `build.node` 符号引用；其他内容与注释保留。
 - `.env`：项目根存在时自动加载，注入所有阶段命令/脚本。
 - `.env` 中的 `FERRY_*` 会被忽略；`FERRY_RESULT_FILE` 由 Ferry 每个脚本单独注入。
 - `plan` 不显示 `.env` 的值，只显示 key。
@@ -241,12 +251,12 @@ targets:
 
 ```text
 before_build   (build)
-sync           (dev -> build)
+sync           (dev -> build；本地原地构建时跳过，本地其他目录时复制)
 run_build      (build)
 after_build    (build)
 
 before_deploy  (deploy)
-transfer       (build -> deploy, 或经 dev)
+transfer       (build -> deploy, 或经 dev / 本地复制)
 run_deploy     (deploy)
 after_deploy   (deploy)
 ```
@@ -329,5 +339,7 @@ FERRY_SSH_PASSWORD=... ferry run t507     # 两端同密码
 | 产物没传过去 | 确认 `out` 相对 `build.workdir`，且 `run_build` 已生成它们 |
 | `.env` 变量没生效 | 确认文件在项目根、变量名不是 `FERRY_` 前缀 |
 | inline 节点连不上 | 检查 `hostname` 以及 `IdentityFile`/`ProxyJump` 等 Host 字段 |
-| Windows 本地 deploy 失败 | 本地 deploy 需要 POSIX `sh`；`deploy.workdir` 建议使用 `C:/...` 形式 |
+| Windows 本地 deploy 失败 | 本地 build/deploy 需要 POSIX `sh`；`workdir` 建议使用 `C:/...` 形式 |
+| 本地构建仍提示缺节点 | 确认 `build.node`/`deploy.node` 写的是 `dev.node`，而不是具体别名 |
+| 本地 build 的 sync 被跳过 | `workdir: .` 表示原地构建；需要隔离构建时改为 `./buildroot` 等路径 |
 | 远端已删除的文件仍残留 | tar 同步不删除远端文件；手工清理构建 workdir |

@@ -268,14 +268,18 @@ def up(
         raise typer.Exit(1) from exc
 
     try:
-        resolved = resolve_target(target_config)
+        resolved = resolve_target(target_config, root)
     except Exception as exc:
         console.print(f"[red]cannot resolve nodes:[/red] {exc}")
         raise typer.Exit(1) from exc
     for warning in resolved.warnings:
         console.print(f"[yellow]warning:[/yellow] {warning}")
 
-    credentials = resolve_credentials(ask=ask_pass)
+    credentials = resolve_credentials(
+        ask=ask_pass,
+        need_build=not resolved.build_is_local,
+        need_target=resolved.deploy_role == "external",
+    )
     passwords: dict[str, str] = {}
     if credentials.build_password:
         passwords["build"] = credentials.build_password
@@ -287,22 +291,34 @@ def up(
     )
 
     try:
-        console.print(f"checking build {resolved.build.display()} ...")
-        _require_ssh(executor, resolved.build, "--ssh")
-        _require_writable(executor, resolved.build, workdir, "--build-workdir")
+        if resolved.build_is_local:
+            console.print("checking local build directory ...")
+            _require_writable(
+                None, None, resolved.build_workdir, "--build-workdir"
+            )
+        else:
+            console.print(f"checking build {resolved.build.display()} ...")
+            _require_ssh(executor, resolved.build, "--ssh")
+            _require_writable(
+                executor, resolved.build, resolved.build_workdir, "--build-workdir"
+            )
 
         if resolved.deploy_role == "external":
             console.print(f"checking deploy {resolved.deploy.display()} ...")
             _require_ssh(executor, resolved.deploy, "--target")
             _require_writable(
-                executor, resolved.deploy, deploy_dir, "--deploy-workdir"
+                executor, resolved.deploy, resolved.deploy_workdir, "--deploy-workdir"
             )
         elif resolved.deploy_role == "build":
-            _require_writable(executor, resolved.build, deploy_dir, "--deploy-workdir")
+            _require_writable(
+                executor, resolved.build, resolved.deploy_workdir, "--deploy-workdir"
+            )
         else:
-            _require_writable(None, None, deploy_dir, "--deploy-workdir")
+            _require_writable(
+                None, None, resolved.deploy_workdir, "--deploy-workdir"
+            )
 
-        if credentials.has_any:
+        if credentials.has_any and not resolved.build_is_local:
             try:
                 if (
                     resolved.deploy_role == "external"
@@ -329,10 +345,13 @@ def up(
             except BootstrapError as exc:
                 console.print(f"[yellow]key bootstrap skipped:[/yellow] {exc}")
 
-        probe = ensure_remote_probe(
-            executor, resolved.build, workdir, reset=reset
-        )
-        console.print(f"probe installed at {probe.path}")
+        if resolved.build_is_local:
+            console.print("local build: no probe installation required")
+        else:
+            probe = ensure_remote_probe(
+                executor, resolved.build, resolved.build_workdir, reset=reset
+            )
+            console.print(f"probe installed at {probe.path}")
     except (ExecError, ProbeError) as exc:
         console.print(f"[red]bootstrap failed:[/red] {exc}")
         raise typer.Exit(1) from exc

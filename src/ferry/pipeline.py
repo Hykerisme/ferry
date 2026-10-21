@@ -18,11 +18,12 @@ from .executors import (
     SshExecutor,
     resolve_remote_ferry_key,
 )
+from .local_probe import LocalProbe
 from .models import ExecRequest, ExecStep, MarkerSpec
 from .nodes import NodeSpec, ResolvedTarget, resolve_target
 from .paths import identity_path
 from .private_config import ensure_gitignore, regenerate_public
-from .probe import ProbeError, RemoteProbe, ensure_remote_probe
+from .probe import Probe, ProbeError, ensure_remote_probe
 from .state import (
     RunState,
     StageState,
@@ -36,6 +37,8 @@ from .transport import (
     artifact_copy_command,
     artifact_transfer_command,
     classify_artifacts_command,
+    copy_artifact_local,
+    copy_tree_local,
     effective_ignores,
     first_component,
     push_stream_to_target,
@@ -85,7 +88,7 @@ class PipelineContext:
     target: TargetCfg
     resolved: ResolvedTarget
     executor: Executor
-    probe: RemoteProbe
+    probe: Probe
     env: dict[str, str]
     route: Route
     run_id: str
@@ -93,6 +96,9 @@ class PipelineContext:
     lock_path: str
     marker_path: str
     clean_paths: list[str]
+    build_is_local: bool = False
+    build_workdir: str = ""
+    deploy_workdir: str = ""
     build_key: str | None = None
 
     @property
@@ -161,57 +167,79 @@ class Pipeline:
     ) -> PipelineContext:
         target = self.target
         try:
-            resolved = resolve_target(target)
+            resolved = resolve_target(target, self.loaded.root)
         except NodeConfigMissing as exc:
             raise PipelineError(str(exc)) from exc
 
         for warning in resolved.warnings:
             self.console.print(f"[yellow]warning:[/yellow] {warning}")
 
-        if not self.executor.check(resolved.build):
-            raise PipelineError(
-                f"cannot reach build node {resolved.build.display()} over SSH"
-            )
-        build_key = resolve_remote_ferry_key(self.executor, resolved.build)
-
-        prefer_via_dev = (
-            bool(self.credentials.target_password)
-            or resolved.transfer_from == "dev"
-        )
-        if resolved.deploy_role == "external":
-            try:
-                edges = probe_edges(
-                    self.executor,
-                    resolved.build,
-                    resolved.deploy,
-                    project=self.project,
-                    target_name=self.target_name,
-                    refresh=refresh_topology,
-                    skip_build_target=prefer_via_dev,
-                    build_key=build_key,
+        build_key: str | None = None
+        if resolved.build_is_local:
+            if resolved.deploy_role == "dev":
+                route = Route(
+                    name="dev->dev",
+                    description="build and deploy run locally",
                 )
-                if resolved.transfer_from == "build" and not edges.build_target:
-                    raise TopologyError(
-                        "transfer_from=build.node but build cannot reach deploy"
+            elif resolved.deploy_role == "external":
+                if not self.executor.check(resolved.deploy):
+                    raise PipelineError(
+                        f"cannot reach deploy node "
+                        f"{resolved.deploy.display()} over SSH"
                     )
-                if resolved.transfer_from == "dev" and not edges.dev_target:
-                    raise TopologyError(
-                        "transfer_from=dev.node but dev cannot reach deploy"
-                    )
-                route = RoutePolicy().decide(edges, prefer_via_dev=prefer_via_dev)
-            except TopologyError as exc:
-                raise PipelineError(str(exc)) from exc
-        elif resolved.deploy_role == "dev":
-            route = Route(
-                name="build->dev",
-                description="artifacts are pulled to dev; deploy phases run locally",
-                uses_dev_relay=True,
-            )
+                route = Route(
+                    name="dev->target",
+                    description="artifacts are pushed from dev; deploy runs remotely",
+                    uses_dev_relay=True,
+                )
+            else:
+                raise PipelineError("local build cannot deploy on a remote build node")
         else:
-            route = Route(
-                name="build->build",
-                description="artifacts stay on build; deploy phases run there",
+            if not self.executor.check(resolved.build):
+                raise PipelineError(
+                    f"cannot reach build node {resolved.build.display()} over SSH"
+                )
+            build_key = resolve_remote_ferry_key(self.executor, resolved.build)
+            prefer_via_dev = (
+                bool(self.credentials.target_password)
+                or resolved.transfer_from == "dev"
             )
+            if resolved.deploy_role == "external":
+                try:
+                    edges = probe_edges(
+                        self.executor,
+                        resolved.build,
+                        resolved.deploy,
+                        project=self.project,
+                        target_name=self.target_name,
+                        refresh=refresh_topology,
+                        skip_build_target=prefer_via_dev,
+                        build_key=build_key,
+                    )
+                    if resolved.transfer_from == "build" and not edges.build_target:
+                        raise TopologyError(
+                            "transfer_from=build.node but build cannot reach deploy"
+                        )
+                    if resolved.transfer_from == "dev" and not edges.dev_target:
+                        raise TopologyError(
+                            "transfer_from=dev.node but dev cannot reach deploy"
+                        )
+                    route = RoutePolicy().decide(
+                        edges, prefer_via_dev=prefer_via_dev
+                    )
+                except TopologyError as exc:
+                    raise PipelineError(str(exc)) from exc
+            elif resolved.deploy_role == "dev":
+                route = Route(
+                    name="build->dev",
+                    description="artifacts are pulled to dev; deploy phases run locally",
+                    uses_dev_relay=True,
+                )
+            else:
+                route = Route(
+                    name="build->build",
+                    description="artifacts stay on build; deploy phases run there",
+                )
 
         self._warn_containment(resolved)
         if self.loaded.private_path is not None:
@@ -220,15 +248,19 @@ class Pipeline:
                 self.console.print(
                     f"[yellow]notice:[/yellow] added to .gitignore: {', '.join(added)}"
                 )
-        probe = ensure_remote_probe(
-            self.executor,
-            resolved.build,
-            target.build.workdir,
-            reset=reset_probe,
-        )
+        probe: Probe
+        if resolved.build_is_local:
+            probe = LocalProbe()
+        else:
+            probe = ensure_remote_probe(
+                self.executor,
+                resolved.build,
+                resolved.build_workdir,
+                reset=reset_probe,
+            )
         env = load_env_file(self.loaded.root)
         run_id = new_run_id()
-        workdir = target.build.workdir.rstrip("/")
+        workdir = resolved.build_workdir.rstrip("/")
         clean = self._clean_paths(target, workdir)
         return PipelineContext(
             loaded=self.loaded,
@@ -244,6 +276,9 @@ class Pipeline:
             lock_path=f"{workdir}/.ferry/{self.target_name}.lock",
             marker_path=f"{workdir}/.ferry/{self.target_name}.marker",
             clean_paths=clean,
+            build_is_local=resolved.build_is_local,
+            build_workdir=resolved.build_workdir,
+            deploy_workdir=resolved.deploy_workdir,
             build_key=build_key,
         )
 
@@ -253,43 +288,64 @@ class Pipeline:
         return [posix_join(workdir, item) for item in clean]
 
     def _warn_containment(self, resolved: ResolvedTarget) -> None:
+        root = self.loaded.root.as_posix().rstrip("/")
+        build_dir = posixpath.normpath(resolved.build_workdir)
+        deploy_dir = posixpath.normpath(resolved.deploy_workdir)
+
+        def overlaps(first: str, second: str) -> bool:
+            return (
+                first == second
+                or first.startswith(second + "/")
+                or second.startswith(first + "/")
+            )
+
+        if (
+            resolved.build_is_local
+            and build_dir != root
+            and root.startswith(build_dir + "/")
+        ):
+            self.console.print(
+                "[yellow]warning:[/yellow] build.workdir contains the project "
+                "root; local sync copies may include unintended files"
+            )
         if resolved.deploy_role == "build":
-            build_dir = posixpath.normpath(self.target.build.workdir)
-            deploy_dir = posixpath.normpath(self.target.deploy.workdir)
-            if (
-                build_dir == deploy_dir
-                or build_dir.startswith(deploy_dir + "/")
-                or deploy_dir.startswith(build_dir + "/")
-            ):
+            if overlaps(build_dir, deploy_dir):
                 self.console.print(
                     "[yellow]warning:[/yellow] build.workdir and deploy.workdir "
                     "overlap; deploy may overwrite build inputs"
                 )
         elif resolved.deploy_role == "dev":
-            root = str(self.loaded.root).replace("\\", "/")
-            deploy_dir = self.target.deploy.workdir.replace("\\", "/").rstrip("/")
-            if (
-                deploy_dir == root
-                or root.startswith(deploy_dir + "/")
-                or deploy_dir.startswith(root + "/")
-            ):
+            if deploy_dir == root or root.startswith(deploy_dir + "/"):
                 self.console.print(
                     "[yellow]warning:[/yellow] deploy.workdir overlaps the project "
                     "root; deploy may overwrite source files"
                 )
+            if resolved.build_is_local and (
+                deploy_dir == build_dir or build_dir.startswith(deploy_dir + "/")
+            ):
+                self.console.print(
+                    "[yellow]warning:[/yellow] build.workdir and deploy.workdir "
+                    "overlap; deploy may overwrite build inputs"
+                )
 
-    def build_steps(self) -> list[PlannedStep]:
+    def build_steps(self, ctx: PipelineContext | None = None) -> list[PlannedStep]:
         target = self.target
         steps: list[PlannedStep] = []
         steps.extend(self._expand(target.build.before_build, "before_build", "build"))
-        steps.append(
-            PlannedStep(
-                phase="sync",
-                kind="sync",
-                where="build",
-                description="sync workspace to build",
-            )
+        in_place = (
+            ctx is not None
+            and ctx.build_is_local
+            and Path(ctx.build_workdir).resolve() == self.loaded.root.resolve()
         )
+        if not in_place:
+            steps.append(
+                PlannedStep(
+                    phase="sync",
+                    kind="sync",
+                    where="build",
+                    description="sync workspace to build",
+                )
+            )
         steps.extend(self._expand(target.build.run_build, "run_build", "build"))
         steps.extend(self._expand(target.build.after_build, "after_build", "build"))
         steps.extend(self._expand(target.deploy.before_deploy, "before_deploy", "deploy"))
@@ -445,16 +501,35 @@ class StepExecutor:
         target = ctx.target
         ignores = effective_ignores(target.sync.ignore, target.build.out)
         self._stage_started("sync")
+        if ctx.build_is_local:
+            destination = Path(ctx.build_workdir)
+            if destination.resolve() == self.pipeline.loaded.root.resolve():
+                self.log.line("[sync] skipped (building in place)")
+                self._mark("sync", "ok")
+                return
+            self.log.line(
+                f"[sync] copying {self.pipeline.loaded.root} -> {destination}"
+            )
+            try:
+                count = copy_tree_local(
+                    self.pipeline.loaded.root, destination, ignores
+                )
+            except Exception:
+                self._mark("sync", "failed")
+                raise
+            self.log.line(f"[sync] {count} entries")
+            self._mark("sync", "ok")
+            return
         self.log.line(
             f"[sync] uploading {self.pipeline.loaded.root} -> "
-            f"{ctx.resolved.build.display()}:{target.build.workdir}"
+            f"{ctx.resolved.build.display()}:{ctx.build_workdir}"
         )
         try:
             count, summary = upload_tree(
                 ctx.executor,
                 ctx.resolved.build,
                 ctx.probe.path,
-                target.build.workdir,
+                ctx.build_workdir,
                 self.pipeline.loaded.root,
                 ignores,
             )
@@ -508,9 +583,9 @@ class StepExecutor:
         ctx = self.ctx
         request = ExecRequest(
             run_id=ctx.run_id,
-            workdir=ctx.target.build.workdir,
+            workdir=ctx.build_workdir,
             steps=self._exec_steps(
-                steps, where="build", cwd=ctx.target.build.workdir
+                steps, where="build", cwd=ctx.build_workdir
             ),
         )
         if marker:
@@ -525,13 +600,13 @@ class StepExecutor:
         ctx = self.ctx
         self._start_phases(steps)
         deploy = ctx.resolved.deploy
-        cwd = ctx.target.deploy.workdir
+        cwd = ctx.deploy_workdir
         if ctx.resolved.deploy_role == "dev":
-            self._run_via_executor(LocalExecutor(), deploy, steps, _local_workdir(cwd))
+            self._run_via_executor(LocalExecutor(), deploy, steps, cwd)
         elif ctx.resolved.deploy_role == "build":
             request = ExecRequest(
                 run_id=ctx.run_id,
-                workdir=ctx.target.build.workdir,
+                workdir=ctx.build_workdir,
                 steps=self._exec_steps(steps, where="build", cwd=cwd),
             )
             try:
@@ -544,7 +619,7 @@ class StepExecutor:
         else:
             request = ExecRequest(
                 run_id=ctx.run_id,
-                workdir=ctx.target.build.workdir,
+                workdir=ctx.build_workdir,
                 target_host=deploy.destination,
                 target_options=deploy.ssh_options(),
                 target_key=ctx.build_key,
@@ -590,16 +665,28 @@ class StepExecutor:
         artifacts = self._classify_artifacts(steps)
         deploy = ctx.resolved.deploy
         role = ctx.resolved.deploy_role
-        workdir = ctx.target.deploy.workdir
+        workdir = ctx.deploy_workdir
         try:
             for artifact in artifacts:
                 self.log.line(
                     f"[transfer] {artifact.relative} -> {deploy.display()}:{workdir}"
                 )
-                if role == "dev":
+                if ctx.build_is_local:
+                    if role == "dev":
+                        copy_artifact_local(
+                            artifact.absolute, artifact.is_dir, workdir
+                        )
+                    else:
+                        push_stream_to_target(
+                            ctx.executor,
+                            deploy,
+                            workdir,
+                            self._probe_chunks(artifact),
+                        )
+                elif role == "dev":
                     chunks = self._probe_chunks(artifact)
                     push_stream_to_target(
-                        LocalExecutor(), deploy, _local_workdir(workdir), chunks
+                        LocalExecutor(), deploy, workdir, chunks
                     )
                 elif role == "build":
                     self._run_build_command(
@@ -634,7 +721,7 @@ class StepExecutor:
     def _run_build_command(self, command: str) -> None:
         request = ExecRequest(
             run_id=self.ctx.run_id,
-            workdir=self.ctx.target.build.workdir,
+            workdir=self.ctx.build_workdir,
             steps=[
                 ExecStep(
                     id="transfer:0",
@@ -643,7 +730,7 @@ class StepExecutor:
                     script_b64=base64.b64encode(command.encode("utf-8")).decode(
                         "ascii"
                     ),
-                    cwd=self.ctx.target.build.workdir,
+                    cwd=self.ctx.build_workdir,
                     env=dict(self.ctx.env),
                 )
             ],
@@ -652,7 +739,25 @@ class StepExecutor:
 
     def _classify_artifacts(self, steps: list[PlannedStep]) -> list[Artifact]:
         entries = [step.artifact for step in steps if step.artifact]
-        workdir = self.ctx.target.build.workdir
+        workdir = self.ctx.build_workdir
+        if self.ctx.build_is_local:
+            local_artifacts: list[Artifact] = []
+            for entry in entries:
+                path = (Path(workdir) / entry).resolve()
+                if path.is_dir():
+                    is_dir = True
+                elif path.is_file():
+                    is_dir = False
+                else:
+                    raise PipelineError(f"artifact not found on build: {entry}")
+                local_artifacts.append(
+                    Artifact(
+                        relative=entry,
+                        absolute=path.as_posix(),
+                        is_dir=is_dir,
+                    )
+                )
+            return local_artifacts
         command = classify_artifacts_command(workdir, entries)
         result = self.ctx.executor.run(
             self.ctx.resolved.build, ["sh", "-c", command], timeout=30
@@ -774,10 +879,6 @@ class StepExecutor:
         save_state(self.state)
 
 
-def _local_workdir(value: str) -> str:
-    return value.replace("\\", "/")
-
-
 def render_plan(console: Console, ctx: PipelineContext, steps: list[PlannedStep]) -> None:
     console.print(f"target: {ctx.target_name}")
     console.print(f"route:  {ctx.route.name} ({ctx.route.description})")
@@ -785,13 +886,19 @@ def render_plan(console: Console, ctx: PipelineContext, steps: list[PlannedStep]
         f"nodes:  dev -> build={ctx.resolved.build.display()} "
         f"-> deploy={ctx.resolved.deploy.display()}"
     )
+    console.print(f"build workdir:  {ctx.build_workdir}")
+    console.print(f"deploy workdir: {ctx.deploy_workdir}")
+    if ctx.build_is_local and not any(step.kind == "sync" for step in steps):
+        console.print("  [sync] skipped (build in place at project root)", markup=False)
     if ctx.env:
         console.print("env:")
         for key, value in sorted(masked_env(ctx.env).items()):
             console.print(f"  {key}={value}")
     console.print("steps:")
     for index, step in enumerate(steps, start=1):
-        console.print(f"  {index:2d}. [{step.phase}] {step.description}")
+        console.print(
+            f"  {index:2d}. [{step.phase}] {step.description}", markup=False
+        )
 
 
 __all__ = [

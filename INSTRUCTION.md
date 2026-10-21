@@ -6,7 +6,7 @@
 
 ## 1. 一句话定位
 
-**Ferry 是一个面向"工具链随镜像分发、构建节点生命周期多变"场景的构建-部署引导器。它不做构建，不碰工具链，只做三件事：把探针送到对的节点、在执行节点上触发用户脚本、按可达性路由数据流。**
+**Ferry 是一个面向"工具链随镜像分发、构建节点生命周期多变"场景的构建-部署引导器。它不做构建，不碰工具链，只做三件事：在需要时把探针送到构建节点、在执行节点上触发用户脚本、按可达性路由数据流。**
 
 竞品不是 GitLab CI，是 `justfile + rsync + ssh + 一个状态脚本` 这个组合。Ferry 要赢的是 TTHW（time to hello world），不是功能数量。
 
@@ -60,8 +60,10 @@ dev (运行 Ferry 的机器，隐式存在)
 - 节点写法：
   - 字符串：`~/.ssh/config` 的 Host 别名；
   - inline 映射：与 `~/.ssh/config` Host 块字段一致（`hostname`、`user`、`port`、`IdentityFile`、`ProxyJump` 等）。
-- `build.node` 必须是具体节点，不能使用引用。
+- `build.node` 必须是具体节点或 `dev.node`（在开发机本地构建），不能使用 `build.node` 引用。
 - `deploy.node` 额外支持 `dev.node`（在开发机本地执行部署）和 `build.node`（在构建机执行部署）。
+- 单机模式：`build.node: dev.node` + `deploy.node: dev.node`，不需要 SSH、探针或远端 Linux。
+- 本地 workdir 相对项目根解析；远程 workdir 必须是 POSIX 绝对路径。
 
 ### 4.2 Target 配置
 
@@ -103,6 +105,14 @@ targets:
 
 **`sync.ignore`**：默认排除 `.git`、`.ferry`、`.private.ferry.yaml`、`.env`、`.venv`、`__pycache__`、`node_modules`；`.private.ferry.yaml` 与 `.env` 永远不传输，`out` 的第一段也会自动排除。
 
+**本地模式**：
+
+- `build.node: dev.node` 时，`workdir` 可写相对项目根的路径（`.`、`./buildroot`）。
+- `workdir` 等于项目根 → 原地构建并跳过 sync；其他路径 → 先用同一套 `sync.ignore` 本地复制工作区。
+- 本地 `deploy.node: dev.node` 的 `workdir` 同样可相对项目根。
+- 本地构建 + `deploy.node: build.node` 归一化为本地部署，并给出警告。
+- 本地构建时 `transfer_from` 无意义，忽略并警告。
+
 配置进 git 管理。`.ferry.yaml` 是可提交的公开配置；真实节点放在 `.private.ferry.yaml`。
 
 ### 4.3 探针（Probe）
@@ -127,7 +137,7 @@ type Probe interface {
 }
 ```
 
-接口不许增加方法；新增节点类型通过同一接口实现。
+接口不许增加方法；新增节点类型通过同一接口实现。`LocalProbe` 是同一接口的进程内实现，用于 `build.node: dev.node`，复用 exec/lock/marker/get_stream 语义。
 
 ### 4.4 阶段与执行顺序
 
@@ -149,7 +159,8 @@ after_deploy  (deploy)
 
 - 所有脚本在它所属的节点执行：build 脚本在构建机，deploy 脚本在部署节点。
 - `before_*` 脚本在对应的批量传输之前**单独下发并执行**，用于提前检查环境，避免浪费带宽。
-- 代码同步只发生在 `sync`；产物传输只发生在 `transfer`。
+- 代码同步只发生在 `sync`；本地原地构建跳过 sync，本地其他 workdir 使用本地复制。
+- 产物传输只发生在 `transfer`；本地 build + 本地 deploy 直接复制文件。
 - 脚本在独立子 shell 中执行，cwd 固定为对应 workdir；环境变量由 `.env` + Ferry 注入。
 - 任一脚本失败 → **fail-fast**，打印"阶段、节点、exit code、最后 20 行日志"，不继续。
 - 目标节点永不驻留 agent：脚本内容由探针/SSH 临时写入并执行，执行后删除。
@@ -172,9 +183,12 @@ after_deploy  (deploy)
 | `transfer_from: dev.node` | 强制经 dev 中转；不可达则报错 |
 | `deploy.node: dev.node` | 产物拉回 dev，部署阶段本地执行 |
 | `deploy.node: build.node` | 部署阶段在 build 执行，产物就地复制 |
+| `build.node: dev.node` + 本地 deploy | 无 SSH，本地构建并复制产物 |
+| `build.node: dev.node` + 外部 deploy | dev 直接推送产物，deploy 脚本经 SSH 执行；只检查 dev→deploy |
 
 - `transfer_from` 只选择**传输路径**，不改变产物来源；产物始终来自 build 的 `run_build` 输出。
 - `deploy.node` 是 `dev.node`/`build.node` 时，`transfer_from` 被忽略并警告。
+- 本地构建时 `transfer_from` 被忽略并警告。
 - 本地部署时，检查 deploy workdir 与项目根/构建目录是否互相包含，命中则警告。
 - 探测结果缓存本地（TTL 5 分钟），`topology` 命令可查看。
 
@@ -214,7 +228,8 @@ after_deploy  (deploy)
 
 - `.private.ferry.yaml` 保存真实节点定义，始终加入 `.gitignore`，绝不同步到构建机。
 - 每次成功 run 后，Ferry 根据 private 配置生成 `.ferry.yaml`：
-  - 删除 `build.node`、`deploy.node`、`deploy.transfer_from`；
+  - 删除具体 `build.node`/`deploy.node` 别名或 inline 映射；
+  - 保留 `dev.node` / `build.node` 符号引用（不含机器信息）与 `transfer_from`；
   - 其他字段、顺序和注释保留（被删节点块的注释可能丢失）。
 - 其他人只拿到 `.ferry.yaml` 时，`run/plan` 会中断并提示补节点（写入 `.private.ferry.yaml` 或运行 `ferry up`）。
 - `.private.ferry.yaml` 和 `.env` 自动加入 `.gitignore` 与同步忽略列表。
@@ -225,9 +240,9 @@ after_deploy  (deploy)
 
 | 命令 | 语义 |
 | --- | --- |
-| `ferry init [-f]` | 初始化项目：生成 `.ferry.yaml`，把 `.private.ferry.yaml`/`.env` 加入 `.gitignore`。 |
-| `ferry up [...] [--ask-pass]` | 交互/参数化填写 build/deploy 节点，校验可达性与目录可写，安装探针，写 `.private.ferry.yaml` 并生成 `.ferry.yaml`。支持别名、inline host alias、`dev.node`/`build.node`。 |
-| `ferry plan <target>` | dry-run：打印节点、路由、`.env` key 和完整步骤，不执行。 |
+| `ferry init [-f] [--local]` | 初始化项目：生成 `.ferry.yaml`，把 `.private.ferry.yaml`/`.env` 加入 `.gitignore`；`--local` 生成可直接 run 的单机 target。 |
+| `ferry up [...] [--ask-pass]` | 交互/参数化填写 build/deploy 节点，校验可达性与目录可写，安装探针，写 `.private.ferry.yaml` 并生成 `.ferry.yaml`。支持别名、inline host alias、`dev.node`/`build.node`；本地 build 跳过 SSH/探针。 |
+| `ferry plan <target>` | dry-run：打印节点、解析后的 workdir、路由、`.env` key 和完整步骤，不执行。 |
 | `ferry run <target> [--cancel]` | 探测 → 同步 → before/run/after build → before/transfer/run/after deploy → 状态落 dev。 |
 | `ferry status [target]` | 读本地状态，表格输出阶段状态、时长、日志路径。 |
 | `ferry topology [target]` | 打印三边探测结果与路由决策。 |
@@ -279,9 +294,9 @@ after_deploy  (deploy)
 9. **状态单点收敛到 dev**：build/OCI 侧状态随容器消失，状态必须回传并落 dev。
 10. **host key 变化必须显式处理**：`up` 使用 `accept-new`；变化时提示 `ssh-keygen -R`。
 11. **脚本结果是脚本 → 工具的单行只读通道**：不解析、不参与控制流。
-12. **不对构建进程强杀**：并发请求拒绝；取消走 SIGTERM + 15s 宽限；marker 只围绕 `run_build`，正常失败也清除，异常中断才保留。
+12. **不对构建进程强杀**：并发请求拒绝；远程取消走 SIGTERM + 15s 宽限；本地 POSIX 用 SIGINT、Windows 用 taskkill；marker 只围绕 `run_build`，正常失败也清除，异常中断才保留。
 13. **密码只用于认证，不落盘**：不引入 `sshpass`；目标密码不下发到构建机。
-14. **节点信息与公开配置分离**：`.private.ferry.yaml` 是源码，`.ferry.yaml` 是生成物；节点被移除，避免上传项目时泄露机器信息。
+14. **节点信息与公开配置分离**：`.private.ferry.yaml` 是源码，`.ferry.yaml` 是生成物；只删除具体别名/inline 节点，保留 `dev.node`/`build.node` 符号引用，避免泄露机器信息。
 15. **脚本按节点归属执行**：build 脚本在 build，deploy 脚本在 deploy；`before_*` 提前单独下发，用于环境检查。
 
 ---
@@ -312,7 +327,7 @@ after_deploy  (deploy)
 
 ```text
 myproj/
-├── .ferry.yaml               # 公开配置（可提交，节点被移除）
+├── .ferry.yaml               # 公开配置（可提交，具体节点被移除，保留符号引用）
 ├── .private.ferry.yaml       # 真实节点配置（gitignore，不同步）
 ├── .env                      # 可选，自动注入环境变量（gitignore）
 ├── scripts/                  # 用户脚本
@@ -343,6 +358,7 @@ ferry/
 │   ├── envfile.py            # .env 解析与掩码
 │   ├── executors.py          # SshExecutor / LocalExecutor / askpass
 │   ├── probe.py              # 探针构建/缓存/握手/NDJSON
+│   ├── local_probe.py        # dev.node 的进程内探针实现
 │   ├── transport.py          # tar、脚本下发、产物传输
 │   ├── topology.py           # 三边探测 + 路由
 │   ├── pipeline.py           # phase 调度 + 状态
@@ -363,7 +379,8 @@ ferry/
 - 换构建机：改 `.private.ferry.yaml` 一个节点定义 / 重跑 `up`，其余零改动。
 - 换部署节点：`ferry up --target ...`，拓扑自动重探测，其余零改动。
 - 换 OCI 镜像：如果预装探针且工作目录路径不变，`ferry run` 直接跑通。
-- 上传项目不泄露节点：`.ferry.yaml` 已移除节点，`.private.ferry.yaml` 不在 git 中。
+- 上传项目不泄露节点：`.ferry.yaml` 已移除具体节点（保留无机器信息的符号引用），`.private.ferry.yaml` 不在 git 中。
+- 单机项目：`ferry init --local` 后即可 `ferry run local`，不需要 SSH/探针。
 - 失败时：错误明确到阶段、节点、exit code、最后 20 行日志。
 
 ---
@@ -376,7 +393,8 @@ ferry/
 - `before_*`/`after_*` 可省略；`run_build`/`run_deploy`/`out` 必填。
 - `.env` 可选；不存在则不注入额外变量。
 - `deploy.transfer_from` 可选；默认按可达性自动选择。
-- `deploy.node` 可用 `dev.node`/`build.node` 表示本地执行。
+- `deploy.node` 可用 `dev.node`/`build.node` 表示本地执行；`build.node: dev.node` 表示本机构建。
+- 本地 build/deploy 的 `workdir` 可相对项目根；`build.workdir: .` 跳过 sync。
 
 **好 schema 让用户在需要时表达，坏 schema 强迫用户每次都表达。**
 
@@ -394,7 +412,7 @@ ferry/
 
 ## 13. 实现优先级
 
-**已完成（v2）**：`init` / `up` / `plan` / `run` / `status` / `topology`；inline 节点与引用；私有/公开配置；`.env`；before/run/after 阶段；产物目录/文件/数组；直推/中转/本地部署；密码与 key 引导。
+**已完成（v2）**：`init` / `up` / `plan` / `run` / `status` / `topology`；inline 节点与引用；私有/公开配置；`.env`；before/run/after 阶段；产物目录/文件/数组；直推/中转/本地部署；密码与 key 引导；单机本地构建（`build.node: dev.node`）。
 
 **后续**：OCI handler 完整实现；`ferry watch`（明确认账后再做）。
 

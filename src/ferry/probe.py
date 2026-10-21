@@ -10,6 +10,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from . import __version__
 from .executors import (
@@ -28,6 +29,20 @@ PROBE_VERSION = __version__
 
 class ProbeError(Exception):
     pass
+
+
+class Probe(Protocol):
+    path: str
+
+    def exec(self, request: ExecRequest) -> Iterator[ExecEvent]: ...
+
+    def acquire_lock(self, path: str) -> int: ...
+
+    def release_lock(self) -> None: ...
+
+    def get_stream(self, root: str, paths: list[str] | None = None) -> Iterator[bytes]: ...
+
+    def terminate(self) -> None: ...
 
 
 def probe_source_dir() -> Path:
