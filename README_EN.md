@@ -48,7 +48,23 @@ ferry status
 ferry topology
 ```
 
-`~/.ssh/config` example:
+### Single-machine development (no SSH, no remote builder)
+
+When the dev machine also acts as build and deploy, use `dev.node`:
+
+```bash
+ferry init --local     # creates target: local, building and deploying locally
+# adjust run_build / out in .ferry.yaml
+ferry plan local
+ferry run local
+```
+
+- `build.workdir: .` builds in place at the project root and skips sync.
+- Any other path (for example `./buildroot`) copies the workspace there first.
+- `deploy.workdir: ./deploy` is relative to the project root.
+- No SSH, probe, or remote Linux is needed; script steps require a POSIX `sh`.
+
+`~/.ssh/config` example (remote nodes only):
 
 ```
 Host buildvm
@@ -64,7 +80,7 @@ See details at [list.md](list.md)
 
 | Command                     | Do What                                                     | Affecting Who                                       |
 | :-------------------------- | ----------------------------------------------------------- | --------------------------------------------------- |
-| `ferry init`              | Init Project, Generate Config Templete                      | Dev                                                 |
+| `ferry init`              | Init Project, generate a config template (`--local` for one machine) | Dev                                                 |
 | `ferry up`                | Prepare for build, try connect nodes, install/prepare probe | ALL NODE                                            |
 | `ferry plan <target>`     | Preview, check if procedure valid                           | No body                                             |
 | `ferry run <target>`      | Sync Codes, build Codes, deploy results                    | ALL NODE                                            |
@@ -94,11 +110,11 @@ uv run ferry --help
 
 - Python 3.10+ (handled automatically when installing with `uv tool` / `pipx`)
 - **(Optional) Go 1.22+ is required when running from source** (for cross-compiling probes; not required for the released wheel)
-- The dev machine can access the build machine and target machine over SSH (key or password authentication)
-- The target machine must provide at least `ssh` + `sh` + `tar`
-- All stage scripts run on the build or deploy node; `deploy.node: dev.node` requires POSIX `sh` on the local machine (bundled with Git for Windows)
+- The dev machine can access remote build/deploy nodes over SSH (key or password authentication)
+- The remote target machine must provide at least `ssh` + `sh` + `tar`
+- All stage scripts run on the build or deploy node; local build/deploy (`dev.node`) requires POSIX `sh` on the local machine (bundled with Git for Windows)
 
-> Currently, the dev machine does not need rsync: dev→build sync uses a Python `tarfile` stream + ssh.
+> Currently, the dev machine does not need rsync: dev→build sync uses a Python `tarfile` stream + ssh; local mode copies files directly or builds in place.
 
 ## SSH Authentication
 
@@ -138,7 +154,7 @@ When only the target machine password is provided, target-side scripts and artif
 
 ## Configuration
 
-`.ferry.yaml` is the committed public config; real node definitions live in `.private.ferry.yaml` (gitignored and never synced). After a successful run, Ferry regenerates `.ferry.yaml` from the private config with node definitions removed, preserving other content and comments. If `.env` exists at the project root, Ferry loads it and injects its variables into all stage commands/scripts.
+`.ferry.yaml` is the committed public config; real node definitions live in `.private.ferry.yaml` (gitignored and never synced). After a successful run, Ferry regenerates `.ferry.yaml` from the private config, removing concrete aliases/inline nodes while keeping symbolic references such as `dev.node` / `build.node`, and preserving other content and comments. If `.env` exists at the project root, Ferry loads it and injects its variables into all stage commands/scripts.
 
 ```yaml
 version: 1
@@ -171,7 +187,10 @@ Rules:
 - Every command runs with `build.workdir` or `deploy.workdir` as cwd; each script runs on its own node.
 - `before_*` scripts are delivered separately before the bulk transfer, so environment checks fail early.
 - `out` is relative to `build.workdir`: a directory copies its contents recursively, a file copies the file, and an array merges each entry.
-- `node` accepts an SSH Host alias or an inline host alias; `deploy.node` also accepts `dev.node` / `build.node`.
+- `node` accepts an SSH Host alias or an inline host alias; `build.node` also accepts `dev.node` (local build), and `deploy.node` also accepts `dev.node` / `build.node`.
+- Remote node `workdir` values must be absolute POSIX paths; `dev.node` accepts paths relative to the project root (`.` , `./buildroot`, `./deploy`).
+- A local `build.workdir` equal to the project root builds in place and skips sync; other paths copy the workspace locally first.
+- `transfer_from` is ignored with a warning for local builds; `deploy.node: build.node` becomes a local deploy when the build is local.
 - `.env` variables are injected into all stage scripts; `FERRY_*` is reserved and `FERRY_RESULT_FILE` is injected per script.
 - Scripts may write one line to `$FERRY_RESULT_FILE`; Ferry passes it back unchanged.
 
@@ -179,9 +198,9 @@ Rules:
 
 - A new `run` for the same target tries to acquire the build lock before sync and refuses if it cannot; it will not kill a running build or overwrite the workspace it is using.
   (It will not automatically kill build processes, avoiding interruption of the build workflow.)
-- `ferry run <target> --cancel` sends `SIGTERM`; the probe forwards the signal to the build process group (for example, docker and cmake will respond to the signal and perform cleanup), waits 15 seconds, and only then sends `SIGKILL`.
+- `ferry run <target> --cancel` requests a stop: remote builds receive `SIGTERM`, the probe forwards it to the build process group (for example, docker and cmake clean up), waits 15 seconds, then sends `SIGKILL`; local runs send `SIGINT` on POSIX and use `taskkill /T` on Windows.
 - A marker is written before `run_build` and deleted on normal completion (success or ordinary failure). Abnormal interruption keeps the marker; the next `run` cleans the first component of `out` and performs one full build. Interruptions during `before_build`/`sync` do not write a marker.
-- The lock uses `flock` and is released by the kernel when the process exits, avoiding stale PID files.
+- The lock uses `flock` (Windows uses `msvcrt.locking`) and is released by the kernel when the process exits, avoiding stale PID files.
 
 ## Local Data List
 
@@ -195,11 +214,12 @@ Rules:
 
 ## Known Limitations
 
-- The target machine must provide `tar` + `sh`; the fallback chain for no tar has not been implemented yet.
-- tar sync does not delete files on the build machine that have been deleted from the source.
+- The target machine must provide `tar` + `sh`; the fallback chain for no tar has not been implemented yet (not needed for all-local targets).
+- tar sync and local copies do not delete files that have been deleted from the source.
 - When multiple `out` directories are merged, files with the same name are overwritten with a warning.
 - In password mode, target-side operations are relayed through dev; if a direct connection is needed, first install keys with `up --ask-pass`.
 - Ferry does not probe, check, or distribute toolchains; handle that in `before_build` / `run_build`.
+- Local-mode commands and scripts require POSIX `sh` on Windows (Git for Windows works).
 - No build caching, concurrent scheduling, rollback, or resident services.
 
 ## Getting the Release Wheel

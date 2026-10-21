@@ -26,19 +26,23 @@ truth. User-facing docs are `README.md` (Chinese), `README_EN.md` (English), and
 2. **Execution phases are fixed:** `before_build -> sync -> run_build ->
    after_build -> before_deploy -> transfer -> run_deploy -> after_deploy`.
    `run_build` / `run_deploy` are required; `before_*` / `after_*` optional.
+   Local in-place builds omit the `sync` step rather than changing phase order.
 3. **Scripts run on the node they belong to.** Build phases on build, deploy
    phases on deploy. `deploy.node: dev.node` runs deploy phases locally.
    `before_*` script content is delivered just-in-time before the bulk transfer.
-4. **Never force-kill a build.** One run holds a remote `flock` from before sync
-   until the run ends. Cancellation is SIGTERM -> 15s grace -> SIGKILL. A marker
-   wraps `run_build` only; it is removed on success or ordinary failure and kept
-   on abnormal termination.
+4. **Never force-kill a build.** One run holds a build lock from before sync
+   until the run ends (`flock` remotely, `LocalProbe` locally). Cancellation is
+   SIGTERM -> 15s grace -> SIGKILL remotely; locally SIGINT (POSIX) or
+   `taskkill /T` (Windows). A marker wraps `run_build` only; it is removed on
+   success or ordinary failure and kept on abnormal termination.
 5. **State converges to dev.** Build/deploy keep no run state. Exceptions: the
    cached probe binary and the crash marker.
 6. **No agent on the deploy node.** Scripts are streamed over ssh, run with
    `sh`, then removed.
 7. **Probe is a dumb executor.** It makes no scheduling decisions. Its public
    interface stays at five methods (`Probe`, `Exec`, `Put`, `Get`, `Version`).
+   `local_probe.py` implements the same five-method client contract in-process
+   for `build.node: dev.node`.
 8. **No rsync assumption on dev.** Syncing uses Python `tarfile` streams over
    ssh.
 9. **No auto-detected environment variables.** There is no `XB_*` injection and
@@ -49,7 +53,8 @@ truth. User-facing docs are `README.md` (Chinese), `README_EN.md` (English), and
     or argv. Never send the deploy password to the build node.
 11. **Node privacy.** `.private.ferry.yaml` holds real node definitions, is
     gitignored, and is never synced. A successful run regenerates `.ferry.yaml`
-    from it with `build.node`, `deploy.node`, and `transfer_from` removed.
+    from it, removing only concrete aliases/inline mappings and preserving
+    symbolic `dev.node` / `build.node` references and `transfer_from`.
 
 ## Architecture map
 
@@ -64,10 +69,11 @@ truth. User-facing docs are `README.md` (Chinese), `README_EN.md` (English), and
 | `src/ferry/auth.py` | password resolution via `--ask-pass` / `FERRY_*_PASSWORD` |
 | `src/ferry/bootstrap.py` | one-time key installation (`up --ask-pass`) |
 | `src/ferry/executors.py` | `SshExecutor` / `LocalExecutor`, askpass env, NodeSpec support |
-| `src/ferry/probe.py` | probe build/cache/upload/handshake, NDJSON client |
-| `src/ferry/transport.py` | tar sync, artifact transfer/relay, script delivery |
+| `src/ferry/probe.py` | probe build/cache/upload/handshake, NDJSON client, `Probe` protocol |
+| `src/ferry/local_probe.py` | in-process probe for `build.node: dev.node` |
+| `src/ferry/transport.py` | tar sync, local copy, artifact transfer/relay, script delivery |
 | `src/ferry/topology.py` | three-edge probing, TTL cache, route policy |
-| `src/ferry/pipeline.py` | phase planning/execution, artifact classification, state |
+| `src/ferry/pipeline.py` | phase planning/execution, local/remote routing, artifact classification, state |
 | `src/ferry/state.py` | `~/.ferry/state/<project>/<target>.json` |
 | `src/ferry/models.py` | wire/event models shared with the probe |
 | `probe/` | Go static probe (stdlib only; Linux target) |
@@ -121,7 +127,14 @@ uv run --isolated --with ./dist/ferry_tool-*-py3-none-any.whl \
 - **Environment variables:** use `.env` via `envfile.py`. Do not reintroduce
   `XB_*` or toolchain probing.
 - **Private/public config:** update `private_config.py`; regeneration must remove
-  only node-related keys and preserve everything else with ruamel round-trip.
+  only concrete node aliases/inline mappings, keep `dev.node`/`build.node`
+  symbols and `transfer_from`, and preserve everything else with ruamel
+  round-trip.
+- **Local mode:** `build.node: dev.node` resolves workdirs against the project
+  root. In-place builds (`workdir: .`) skip sync; other local workdirs copy the
+  workspace. Local builds use `LocalProbe`, require no SSH or bundled probe, and
+  deploy either locally (`dev.node`) or via dev push. Keep `resolve_target`
+  callers passing the project root.
 - **Version bump:** `pyproject.toml` is the single source (`PROBE_VERSION` and
   `scripts/build_probe.py` read it). Rebuild bundled probes after Go changes.
 - **Release:** bump version -> commit -> `git tag vX.Y.Z` -> push tag. CI runs
@@ -138,10 +151,16 @@ uv run --isolated --with ./dist/ferry_tool-*-py3-none-any.whl \
   enforces this even if the user overrides `sync.ignore`.
 - `.env` values are secret-like: mask them in `plan` and never log values.
 - Inline SSH options follow `~/.ssh/config` Host keys; reject `Host`/`Match`/
-  `Include`. `build.node` must be concrete; only `deploy.node` accepts refs.
-- `out` is relative to `build.workdir`; directory contents are merged into
-  `deploy.workdir`. Artifact collisions overwrite with a warning.
-- Windows local deploy needs POSIX `sh`; path containment checks are best-effort.
+  `Include`. `build.node` accepts a concrete alias, inline mapping, or
+  `dev.node` (never `build.node`); only `deploy.node` accepts `build.node`.
+- Remote workdirs must be absolute POSIX paths; local build/deploy workdirs may
+  be relative to the project root and must not contain `..`.
+- `out` is relative to the resolved `build.workdir`; directory contents are
+  merged into `deploy.workdir`. Artifact collisions overwrite with a warning.
+- Local build/deploy requires POSIX `sh` (Git for Windows works). Windows
+  cancellation uses `taskkill /T`; local locks use `msvcrt.locking`.
+- Local in-place builds put `.ferry/` (lock/marker) inside the project root;
+  `ferry init --local` adds it to `.gitignore`.
 - Old schema fields (`build_cmd`, `stages`, `toolchain`, `deploy.path`) are
   rejected. This is an intentional breaking change.
 - Do not commit unless explicitly asked. Run the checks above and state which
