@@ -39,7 +39,6 @@ class RunState(BaseModel):
     run_id: str
     commit: str | None = None
     dirty: bool | None = None
-    toolchain: str | None = None
     topology: str | None = None
     stages: dict[str, StageState] = Field(default_factory=dict)
     log: str | None = None

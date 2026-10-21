@@ -1,44 +1,59 @@
 from __future__ import annotations
 
 import base64
-import os
-import subprocess
-import tempfile
+import posixpath
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from rich.console import Console
 
 from .auth import Credentials
-from .config import (
-    LoadedConfig,
-    ResolvedScript,
-    TargetCfg,
-    first_component,
-    resolve_stage_scripts,
+from .config import LoadedConfig, NodeConfigMissing, TargetCfg
+from .envfile import load_env_file, masked_env
+from .executors import (
+    Executor,
+    LocalExecutor,
+    SshExecutor,
+    resolve_remote_ferry_key,
 )
-from .executors import Executor, SshExecutor
-from .facts import FactError, collect_target_info
-from .models import ExecEvent, ExecRequest, ExecStep, MarkerSpec, NodeInfo
+from .models import ExecRequest, ExecStep, MarkerSpec
+from .nodes import NodeSpec, ResolvedTarget, resolve_target
 from .paths import identity_path
+from .private_config import ensure_gitignore, regenerate_public
 from .probe import ProbeError, RemoteProbe, ensure_remote_probe
 from .state import (
     RunState,
     StageState,
     git_info,
-    load_state,
     log_path,
     new_run_id,
     save_state,
 )
 from .topology import Route, RoutePolicy, TopologyError, probe_edges
 from .transport import (
-    artifact_push_command,
+    artifact_copy_command,
+    artifact_transfer_command,
+    classify_artifacts_command,
     effective_ignores,
+    first_component,
     push_stream_to_target,
     run_target_script,
     upload_tree,
 )
+
+Phase = Literal[
+    "before_build",
+    "sync",
+    "run_build",
+    "after_build",
+    "before_deploy",
+    "transfer",
+    "run_deploy",
+    "after_deploy",
+]
+StepKind = Literal["command", "script", "sync", "transfer"]
 
 
 class PipelineError(Exception):
@@ -47,12 +62,20 @@ class PipelineError(Exception):
 
 @dataclass
 class PlannedStep:
-    stage: str
-    where: str
-    kind: str
+    phase: Phase
+    kind: StepKind
+    where: Literal["build", "deploy"]
     description: str
-    script: ResolvedScript | None = None
     command: str | None = None
+    script: str | None = None
+    artifact: str | None = None
+
+
+@dataclass
+class Artifact:
+    relative: str
+    absolute: str
+    is_dir: bool
 
 
 @dataclass
@@ -60,9 +83,9 @@ class PipelineContext:
     loaded: LoadedConfig
     target_name: str
     target: TargetCfg
+    resolved: ResolvedTarget
     executor: Executor
     probe: RemoteProbe
-    info: NodeInfo
     env: dict[str, str]
     route: Route
     run_id: str
@@ -70,57 +93,15 @@ class PipelineContext:
     lock_path: str
     marker_path: str
     clean_paths: list[str]
-    toolchain_version: str | None = None
-    target_password: str | None = None
+    build_key: str | None = None
 
     @property
     def project(self) -> str:
         return self.loaded.config.project.name or self.loaded.root.name
 
-    @property
-    def remote_out(self) -> str:
-        return posix_join(self.target.build.workdir, self.target.out)
-
 
 def posix_join(base: str, relative: str) -> str:
-    return base.rstrip("/") + "/" + relative.lstrip("/").replace("\\", "/")
-
-
-def check_toolchain_version(
-    probe: RemoteProbe,
-    node: str,
-    workdir: str,
-    command: str,
-    expect: str | None,
-) -> str | None:
-    request = ExecRequest(
-        run_id="toolchain-check",
-        workdir=workdir,
-        steps=[
-            ExecStep(
-                id="toolchain",
-                where="build",
-                argv=["sh", "-c", command],
-                cwd=workdir,
-            )
-        ],
-    )
-    chunks: list[bytes] = []
-    code: int | None = None
-    for event in probe.exec(request):
-        if event.event == "out" and event.stream == "stdout" and event.chunk:
-            chunks.append(base64.b64decode(event.chunk))
-        if event.event == "step_end":
-            code = event.code
-    if code not in (0, None):
-        raise PipelineError(f"toolchain probe failed on {node} (exit code {code}): {command}")
-    value = b"".join(chunks).decode("utf-8", errors="replace").strip()
-    value = value.splitlines()[-1].strip() if value else ""
-    if expect is not None and value != expect:
-        raise PipelineError(
-            f"toolchain mismatch on {node}: expected {expect!r}, got {value!r}"
-        )
-    return value or None
+    return posixpath.normpath(posixpath.join(base, relative))
 
 
 class RunLog:
@@ -160,9 +141,9 @@ class Pipeline:
         else:
             passwords: dict[str, str] = {}
             if self.credentials.build_password:
-                passwords[self.target.build.node] = self.credentials.build_password
+                passwords["build"] = self.credentials.build_password
             if self.credentials.target_password:
-                passwords[self.target.deploy.node] = self.credentials.target_password
+                passwords["deploy"] = self.credentials.target_password
             identity = str(identity_path()) if identity_path().is_file() else None
             self.executor = SshExecutor(passwords=passwords, identity=identity)
 
@@ -179,147 +160,182 @@ class Pipeline:
         self, *, refresh_topology: bool = False, reset_probe: bool = False
     ) -> PipelineContext:
         target = self.target
-        prefer_via_dev = bool(self.credentials.target_password)
         try:
-            edges = probe_edges(
-                self.executor,
-                target.build.node,
-                target.deploy.node,
-                project=self.project,
-                target=self.target_name,
-                refresh=refresh_topology,
-                skip_build_target=prefer_via_dev,
-                build_key=target.build.ssh_key,
-            )
-        except Exception as exc:
-            raise PipelineError(f"topology probing failed: {exc}") from exc
-        try:
-            route = RoutePolicy().decide(edges, prefer_via_dev=prefer_via_dev)
-        except TopologyError as exc:
+            resolved = resolve_target(target)
+        except NodeConfigMissing as exc:
             raise PipelineError(str(exc)) from exc
 
+        for warning in resolved.warnings:
+            self.console.print(f"[yellow]warning:[/yellow] {warning}")
+
+        if not self.executor.check(resolved.build):
+            raise PipelineError(
+                f"cannot reach build node {resolved.build.display()} over SSH"
+            )
+        build_key = resolve_remote_ferry_key(self.executor, resolved.build)
+
+        prefer_via_dev = (
+            bool(self.credentials.target_password)
+            or resolved.transfer_from == "dev"
+        )
+        if resolved.deploy_role == "external":
+            try:
+                edges = probe_edges(
+                    self.executor,
+                    resolved.build,
+                    resolved.deploy,
+                    project=self.project,
+                    target_name=self.target_name,
+                    refresh=refresh_topology,
+                    skip_build_target=prefer_via_dev,
+                    build_key=build_key,
+                )
+                if resolved.transfer_from == "build" and not edges.build_target:
+                    raise TopologyError(
+                        "transfer_from=build.node but build cannot reach deploy"
+                    )
+                if resolved.transfer_from == "dev" and not edges.dev_target:
+                    raise TopologyError(
+                        "transfer_from=dev.node but dev cannot reach deploy"
+                    )
+                route = RoutePolicy().decide(edges, prefer_via_dev=prefer_via_dev)
+            except TopologyError as exc:
+                raise PipelineError(str(exc)) from exc
+        elif resolved.deploy_role == "dev":
+            route = Route(
+                name="build->dev",
+                description="artifacts are pulled to dev; deploy phases run locally",
+                uses_dev_relay=True,
+            )
+        else:
+            route = Route(
+                name="build->build",
+                description="artifacts stay on build; deploy phases run there",
+            )
+
+        self._warn_containment(resolved)
+        if self.loaded.private_path is not None:
+            added = ensure_gitignore(self.loaded.root)
+            if added:
+                self.console.print(
+                    f"[yellow]notice:[/yellow] added to .gitignore: {', '.join(added)}"
+                )
         probe = ensure_remote_probe(
             self.executor,
-            target.build.node,
+            resolved.build,
             target.build.workdir,
             reset=reset_probe,
         )
-        info = probe.info()
-        try:
-            target_info = collect_target_info(
-                self.executor,
-                target,
-                probe,
-                dev_reachable=edges.dev_target,
-            )
-        except FactError as exc:
-            if not target.env:
-                raise PipelineError(str(exc)) from exc
-            self.console.print(f"[yellow]warning:[/yellow] {exc}")
-            target_info = NodeInfo()
-        toolchain_version = self._check_toolchain(probe)
-        env = build_environment(
-            self.project,
-            self.target_name,
-            info,
-            target_info,
-            toolchain_version,
-            target.env,
-        )
+        env = load_env_file(self.loaded.root)
         run_id = new_run_id()
         workdir = target.build.workdir.rstrip("/")
-        clean = target.build.clean or [first_component(target.out)]
+        clean = self._clean_paths(target, workdir)
         return PipelineContext(
             loaded=self.loaded,
             target_name=self.target_name,
             target=target,
+            resolved=resolved,
             executor=self.executor,
             probe=probe,
-            info=target_info,
             env=env,
             route=route,
             run_id=run_id,
             log_file=log_path(self.project, self.target_name, run_id),
             lock_path=f"{workdir}/.ferry/{self.target_name}.lock",
             marker_path=f"{workdir}/.ferry/{self.target_name}.marker",
-            clean_paths=[posix_join(workdir, item) for item in clean],
-            toolchain_version=toolchain_version,
-            target_password=self.credentials.target_password,
+            clean_paths=clean,
+            build_key=build_key,
         )
 
-    def _check_toolchain(self, probe: RemoteProbe) -> str | None:
-        toolchain = self.target.toolchain
-        if not toolchain.probe:
-            return None
-        return check_toolchain_version(
-            probe,
-            self.target.build.node,
-            self.target.build.workdir,
-            toolchain.probe,
-            toolchain.expect,
-        )
+    def _clean_paths(self, target: TargetCfg, workdir: str) -> list[str]:
+        entries = target.build.out if isinstance(target.build.out, list) else [target.build.out]
+        clean = sorted({first_component(entry) for entry in entries})
+        return [posix_join(workdir, item) for item in clean]
 
-    def build_steps(self, *, via_dev: bool = False) -> list[PlannedStep]:
+    def _warn_containment(self, resolved: ResolvedTarget) -> None:
+        if resolved.deploy_role == "build":
+            build_dir = posixpath.normpath(self.target.build.workdir)
+            deploy_dir = posixpath.normpath(self.target.deploy.workdir)
+            if (
+                build_dir == deploy_dir
+                or build_dir.startswith(deploy_dir + "/")
+                or deploy_dir.startswith(build_dir + "/")
+            ):
+                self.console.print(
+                    "[yellow]warning:[/yellow] build.workdir and deploy.workdir "
+                    "overlap; deploy may overwrite build inputs"
+                )
+        elif resolved.deploy_role == "dev":
+            root = str(self.loaded.root).replace("\\", "/")
+            deploy_dir = self.target.deploy.workdir.replace("\\", "/").rstrip("/")
+            if (
+                deploy_dir == root
+                or root.startswith(deploy_dir + "/")
+                or deploy_dir.startswith(root + "/")
+            ):
+                self.console.print(
+                    "[yellow]warning:[/yellow] deploy.workdir overlaps the project "
+                    "root; deploy may overwrite source files"
+                )
+
+    def build_steps(self) -> list[PlannedStep]:
         target = self.target
         steps: list[PlannedStep] = []
-
-        def add_scripts(stage: str) -> None:
-            for script in resolve_stage_scripts(target, stage):
-                steps.append(script_step(stage, script))
-
-        add_scripts("pre_sync")
+        steps.extend(self._expand(target.build.before_build, "before_build", "build"))
         steps.append(
             PlannedStep(
-                stage="sync",
-                where="build",
+                phase="sync",
                 kind="sync",
+                where="build",
                 description="sync workspace to build",
             )
         )
-        add_scripts("post_sync")
-        add_scripts("pre_build")
-        steps.append(
-            PlannedStep(
-                stage="build",
-                where="build",
-                kind="build",
-                description=target.build_cmd,
-                command=target.build_cmd,
-            )
-        )
-        add_scripts("post_build")
-        add_scripts("pre_deploy")
-        if via_dev:
+        steps.extend(self._expand(target.build.run_build, "run_build", "build"))
+        steps.extend(self._expand(target.build.after_build, "after_build", "build"))
+        steps.extend(self._expand(target.deploy.before_deploy, "before_deploy", "deploy"))
+        entries = target.build.out if isinstance(target.build.out, list) else [target.build.out]
+        for entry in entries:
             steps.append(
                 PlannedStep(
-                    stage="deploy",
-                    where="dev",
-                    kind="deploy_via_dev",
-                    description=(
-                        f"pull {target.out} from build and push to "
-                        f"{target.deploy.node}:{target.deploy.path}"
-                    ),
-                )
-            )
-        else:
-            steps.append(
-                PlannedStep(
-                    stage="deploy",
-                    where="build",
+                    phase="transfer",
                     kind="transfer",
-                    description=(
-                        f"push {target.out} to {target.deploy.node}:{target.deploy.path}"
-                    ),
-                    command=artifact_push_command(
-                        posix_join(target.build.workdir, target.out),
-                        target.deploy.node,
-                        target.deploy.path,
-                        key=target.build.ssh_key,
-                    ),
+                    where="deploy",
+                    description=f"transfer {entry}",
+                    artifact=entry,
                 )
             )
-        add_scripts("post_deploy")
+        steps.extend(self._expand(target.deploy.run_deploy, "run_deploy", "deploy"))
+        steps.extend(self._expand(target.deploy.after_deploy, "after_deploy", "deploy"))
         return steps
+
+    def _expand(
+        self,
+        spec: str | list[str] | None,
+        phase: Phase,
+        where: Literal["build", "deploy"],
+    ) -> list[PlannedStep]:
+        if spec is None:
+            return []
+        if isinstance(spec, str):
+            return [
+                PlannedStep(
+                    phase=phase,
+                    kind="command",
+                    where=where,
+                    description=spec,
+                    command=spec,
+                )
+            ]
+        return [
+            PlannedStep(
+                phase=phase,
+                kind="script",
+                where=where,
+                description=path,
+                script=path,
+            )
+            for path in spec
+        ]
 
     def execute(
         self, ctx: PipelineContext, steps: list[PlannedStep], *, dry_run: bool = False
@@ -331,15 +347,12 @@ class Pipeline:
             run_id=ctx.run_id,
             commit=commit,
             dirty=dirty,
-            toolchain=ctx.toolchain_version,
             topology=ctx.route.name,
             log=str(ctx.log_file),
-            build_node=self.target.build.node,
+            build_node=ctx.resolved.build.key,
         )
-        previous = load_state(self.project, self.target_name)
         log = RunLog(ctx.log_file, self.console)
         try:
-            self._warn_drift(previous, ctx, log)
             if dry_run:
                 render_plan(self.console, ctx, steps)
                 return state
@@ -369,34 +382,15 @@ class Pipeline:
                 state.lock_pid = None
                 state.probe_pid = None
                 save_state(state)
+            if ctx.loaded.private_path is not None:
+                regenerate_public(
+                    ctx.loaded.private_path,
+                    ctx.loaded.root / ".ferry.yaml",
+                )
+                log.line("regenerated .ferry.yaml without node definitions")
             return state
         finally:
             log.close()
-
-    def _warn_drift(self, previous: RunState | None, ctx: PipelineContext, log: RunLog) -> None:
-        if previous is None:
-            return
-        if (
-            previous.toolchain
-            and ctx.toolchain_version
-            and previous.toolchain != ctx.toolchain_version
-        ):
-            log.line(
-                f"warning: toolchain changed since last run "
-                f"({previous.toolchain} -> {ctx.toolchain_version}); consider 'ferry up'",
-                style="yellow",
-            )
-
-
-def script_step(stage: str, script: ResolvedScript) -> PlannedStep:
-    location = script.where
-    return PlannedStep(
-        stage=stage,
-        where=location,
-        kind=f"{location}_script",
-        description=f"{script.path} on {location}",
-        script=script,
-    )
 
 
 class StepExecutor:
@@ -411,373 +405,393 @@ class StepExecutor:
         self.interrupted = False
 
     def run(self, steps: list[PlannedStep]) -> None:
-        for group_name, group in self._group(steps):
-            if group[0].kind == "sync":
-                self._run_sync(group[0])
+        index = 0
+        while index < len(steps):
+            step = steps[index]
+            if step.kind == "sync":
+                self._run_sync()
+                index += 1
                 continue
-            if group[0].kind == "deploy_via_dev":
-                self._deploy_via_dev(group[0])
+            if step.phase == "transfer":
+                self._run_transfer(steps[index:])
+                while index < len(steps) and steps[index].phase == "transfer":
+                    index += 1
                 continue
-            batch: list[PlannedStep] = []
-            for step in group:
-                if step.where == "dev":
-                    if batch:
-                        self._run_remote(group_name, batch)
-                        batch = []
-                    self._run_local(step)
-                elif step.where == "target" and self.ctx.route.uses_dev_relay:
-                    if batch:
-                        self._run_remote(group_name, batch)
-                        batch = []
-                    self._run_target_via_dev(step)
-                else:
-                    batch.append(step)
-            if batch:
-                self._run_remote(group_name, batch)
+            if step.phase in ("run_build", "after_build"):
+                group = [
+                    item
+                    for item in steps
+                    if item.phase in ("run_build", "after_build")
+                ]
+                self._run_build_phase(group, marker=True)
+                while index < len(steps) and steps[index].phase in ("run_build", "after_build"):
+                    index += 1
+                continue
+            if step.phase == "before_build":
+                group = [item for item in steps if item.phase == "before_build"]
+                self._run_build_phase(group, marker=False)
+                while index < len(steps) and steps[index].phase == "before_build":
+                    index += 1
+                continue
+            group = [
+                item for item in steps if item.phase == step.phase
+            ]
+            self._run_deploy_phase(group)
+            while index < len(steps) and steps[index].phase == step.phase:
+                index += 1
 
-    def _group(self, steps: list[PlannedStep]) -> list[tuple[str, list[PlannedStep]]]:
-        build_phase = {"pre_build", "build", "post_build"}
-        groups: list[tuple[str, list[PlannedStep]]] = []
-        key: str | None = None
-        current: list[PlannedStep] = []
-        for step in steps:
-            step_key = "build-phase" if step.stage in build_phase else step.stage
-            if current and step_key != key:
-                groups.append((key or step.stage, current))
-                current = []
-            key = step_key
-            current.append(step)
-        if current:
-            groups.append((key or current[0].stage, current))
-        return groups
-
-    def _run_sync(self, step: PlannedStep) -> None:
+    def _run_sync(self) -> None:
         ctx = self.ctx
-        ignores = effective_ignores(ctx.target.sync.ignore, ctx.target.out)
-        self._stage_started(step.stage)
+        target = ctx.target
+        ignores = effective_ignores(target.sync.ignore, target.build.out)
+        self._stage_started("sync")
         self.log.line(
             f"[sync] uploading {self.pipeline.loaded.root} -> "
-            f"{ctx.target.build.node}:{ctx.target.build.workdir}"
+            f"{ctx.resolved.build.display()}:{target.build.workdir}"
         )
-        count, summary = upload_tree(
-            ctx.executor,
-            ctx.target.build.node,
-            ctx.probe.path,
-            ctx.target.build.workdir,
-            self.pipeline.loaded.root,
-            ignores,
-        )
+        try:
+            count, summary = upload_tree(
+                ctx.executor,
+                ctx.resolved.build,
+                ctx.probe.path,
+                target.build.workdir,
+                self.pipeline.loaded.root,
+                ignores,
+            )
+        except Exception:
+            self._mark("sync", "failed")
+            raise
         self.log.line(f"[sync] {count} entries ({summary})")
         self._mark("sync", "ok")
 
-    def _run_local(self, step: PlannedStep) -> None:
-        script = step.script
-        assert script is not None
-        path = self.pipeline.loaded.root / script.path
+    def _step_content(self, step: PlannedStep) -> bytes:
+        if step.kind == "command":
+            assert step.command is not None
+            return step.command.encode("utf-8")
+        assert step.script is not None
+        path = self.pipeline.loaded.root / step.script
         if not path.is_file():
-            raise PipelineError(f"script not found: {script.path}")
-        self._stage_started(step.stage)
-        self.log.line(f"[{step.stage}] dev: sh {script.path}")
-        env = dict(os.environ)
-        env.update(self.ctx.env)
-        with tempfile.NamedTemporaryFile(delete=False) as handle:
-            result_path = handle.name
-        env["FERRY_RESULT_FILE"] = result_path
-        try:
-            completed = subprocess.run(
-                ["sh", str(path)],
-                cwd=self.pipeline.loaded.root,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            for line in completed.stdout.splitlines():
-                self.log.line(line)
-            for line in completed.stderr.splitlines():
-                self.log.line(line)
-            result = read_local_script_result(result_path)
-            if completed.returncode != 0:
-                self._fail(step, completed.returncode, completed.stderr[-2000:], result)
-            if result:
-                self.log.line(f"[{step.stage}] result: {result}")
-            self._mark(step.stage, "ok")
-        finally:
-            try:
-                os.unlink(result_path)
-            except OSError:
-                pass
+            raise PipelineError(f"script not found: {step.script}")
+        return path.read_bytes()
 
-    def _run_remote(self, group_name: str, steps: list[PlannedStep]) -> None:
+    def _exec_steps(
+        self,
+        steps: list[PlannedStep],
+        *,
+        where: Literal["build", "target"],
+        cwd: str,
+    ) -> list[ExecStep]:
+        result: list[ExecStep] = []
+        for index, step in enumerate(steps):
+            content = self._step_content(step)
+            result.append(
+                ExecStep(
+                    id=f"{step.phase}:{index}",
+                    where=where,
+                    kind="script",
+                    script_b64=base64.b64encode(content).decode("ascii"),
+                    cwd=cwd,
+                    env=dict(self.ctx.env),
+                    result=True,
+                    target_host=(
+                        self.ctx.resolved.deploy.destination
+                        if where == "target"
+                        else None
+                    ),
+                )
+            )
+        return result
+
+    def _run_build_phase(self, steps: list[PlannedStep], *, marker: bool) -> None:
+        if not steps:
+            return
         ctx = self.ctx
-        target = ctx.target
-        is_build_phase = group_name == "build-phase"
-        exec_steps = [self._exec_step(step) for step in steps]
         request = ExecRequest(
             run_id=ctx.run_id,
-            workdir=target.build.workdir,
-            target_host=target.deploy.node,
-            target_key=target.build.ssh_key,
-            steps=exec_steps,
+            workdir=ctx.target.build.workdir,
+            steps=self._exec_steps(
+                steps, where="build", cwd=ctx.target.build.workdir
+            ),
         )
-        if is_build_phase:
+        if marker:
             request.marker = MarkerSpec(path=ctx.marker_path)
             request.clean_paths = ctx.clean_paths
+        self._start_phases(steps)
+        self._consume(request, steps)
 
-        self._stage_started(steps[0].stage)
+    def _run_deploy_phase(self, steps: list[PlannedStep]) -> None:
+        if not steps:
+            return
+        ctx = self.ctx
+        self._start_phases(steps)
+        deploy = ctx.resolved.deploy
+        cwd = ctx.target.deploy.workdir
+        if ctx.resolved.deploy_role == "dev":
+            self._run_via_executor(LocalExecutor(), deploy, steps, _local_workdir(cwd))
+        elif ctx.resolved.deploy_role == "build":
+            request = ExecRequest(
+                run_id=ctx.run_id,
+                workdir=ctx.target.build.workdir,
+                steps=self._exec_steps(steps, where="build", cwd=cwd),
+            )
+            try:
+                self._consume(request, steps)
+            except Exception:
+                self._mark_failed_phases(steps)
+                raise
+        elif ctx.route.uses_dev_relay:
+            self._run_via_executor(ctx.executor, deploy, steps, cwd)
+        else:
+            request = ExecRequest(
+                run_id=ctx.run_id,
+                workdir=ctx.target.build.workdir,
+                target_host=deploy.destination,
+                target_options=deploy.ssh_options(),
+                target_key=ctx.build_key,
+                steps=self._exec_steps(steps, where="target", cwd=cwd),
+            )
+            try:
+                self._consume(request, steps)
+            except Exception:
+                self._mark_failed_phases(steps)
+                raise
+
+    def _run_via_executor(
+        self,
+        executor: Executor,
+        node: NodeSpec,
+        steps: list[PlannedStep],
+        cwd: str,
+    ) -> None:
+        for step in steps:
+            self._stage_started(step.phase)
+            content = self._step_content(step)
+            self.log.line(f"[{step.phase}] {step.description}")
+            outcome = run_target_script(
+                executor, node, content, cwd, self.ctx.env
+            )
+            for line in outcome.stdout.splitlines():
+                self.log.line(f"  {line}")
+            for line in outcome.stderr.splitlines():
+                self.log.line(f"  {line}")
+            if outcome.code != 0:
+                self._mark(step.phase, "failed")
+                raise PipelineError(
+                    f"{step.phase} failed on {node.display()} "
+                    f"(exit code {outcome.code})"
+                )
+            self._mark(step.phase, "ok")
+            if outcome.result:
+                self.log.line(f"[{step.phase}] result: {outcome.result}")
+
+    def _run_transfer(self, steps: list[PlannedStep]) -> None:
+        ctx = self.ctx
+        self._stage_started("transfer")
+        artifacts = self._classify_artifacts(steps)
+        deploy = ctx.resolved.deploy
+        role = ctx.resolved.deploy_role
+        workdir = ctx.target.deploy.workdir
+        try:
+            for artifact in artifacts:
+                self.log.line(
+                    f"[transfer] {artifact.relative} -> {deploy.display()}:{workdir}"
+                )
+                if role == "dev":
+                    chunks = self._probe_chunks(artifact)
+                    push_stream_to_target(
+                        LocalExecutor(), deploy, _local_workdir(workdir), chunks
+                    )
+                elif role == "build":
+                    self._run_build_command(
+                        artifact_copy_command(artifact.absolute, artifact.is_dir, workdir)
+                    )
+                elif ctx.route.uses_dev_relay:
+                    chunks = self._probe_chunks(artifact)
+                    push_stream_to_target(ctx.executor, deploy, workdir, chunks)
+                else:
+                    self._run_build_command(
+                        artifact_transfer_command(
+                            artifact.absolute,
+                            artifact.is_dir,
+                            deploy,
+                            workdir,
+                            key=ctx.build_key,
+                        )
+                    )
+        except Exception:
+            self._mark("transfer", "failed")
+            raise
+        self._mark("transfer", "ok")
+
+    def _probe_chunks(self, artifact: Artifact) -> Iterator[bytes]:
+        if artifact.is_dir:
+            return self.ctx.probe.get_stream(artifact.absolute)
+        return self.ctx.probe.get_stream(
+            posixpath.dirname(artifact.absolute),
+            [posixpath.basename(artifact.absolute)],
+        )
+
+    def _run_build_command(self, command: str) -> None:
+        request = ExecRequest(
+            run_id=self.ctx.run_id,
+            workdir=self.ctx.target.build.workdir,
+            steps=[
+                ExecStep(
+                    id="transfer:0",
+                    where="build",
+                    kind="script",
+                    script_b64=base64.b64encode(command.encode("utf-8")).decode(
+                        "ascii"
+                    ),
+                    cwd=self.ctx.target.build.workdir,
+                    env=dict(self.ctx.env),
+                )
+            ],
+        )
+        self._consume(request, [], mark_phases=False)
+
+    def _classify_artifacts(self, steps: list[PlannedStep]) -> list[Artifact]:
+        entries = [step.artifact for step in steps if step.artifact]
+        workdir = self.ctx.target.build.workdir
+        command = classify_artifacts_command(workdir, entries)
+        result = self.ctx.executor.run(
+            self.ctx.resolved.build, ["sh", "-c", command], timeout=30
+        )
+        if result.returncode != 0:
+            raise PipelineError(
+                f"cannot inspect artifacts on build: {result.stderr_text.strip()}"
+            )
+        types: dict[str, bool] = {}
+        for line in result.stdout_text.splitlines():
+            if line.startswith("dir:"):
+                types[line[4:]] = True
+            elif line.startswith("file:"):
+                types[line[5:]] = False
+        artifacts: list[Artifact] = []
+        for entry in entries:
+            if entry not in types:
+                raise PipelineError(f"artifact not found on build: {entry}")
+            absolute = posix_join(workdir, entry)
+            artifacts.append(
+                Artifact(relative=entry, absolute=absolute, is_dir=types[entry])
+            )
+        return artifacts
+
+    def _consume(
+        self,
+        request: ExecRequest,
+        steps: list[PlannedStep],
+        *,
+        mark_phases: bool = True,
+    ) -> None:
+        by_id = {
+            f"{step.phase}:{index}": step for index, step in enumerate(steps)
+        }
         executed: set[str] = set()
-        for event in ctx.probe.exec(request):
-            self._handle_event(event, steps, executed)
+        for event in self.ctx.probe.exec(request):
+            if event.event == "start":
+                if event.pid:
+                    self.state.probe_pid = event.pid
+                    save_state(self.state)
+            elif event.event == "recovery":
+                cleaned = event.cleaned or []
+                self.log.line(
+                    f"[recovery] previous build was interrupted; cleaned: "
+                    f"{', '.join(cleaned) or 'nothing'}",
+                    style="yellow",
+                )
+            elif event.event == "error":
+                raise PipelineError(
+                    f"probe error: {event.message or 'unknown error'}"
+                )
+            elif event.event == "step_start" and event.id:
+                step = by_id.get(event.id)
+                if step is not None:
+                    self._stage_started(step.phase)
+                    self.log.line(f"[{step.phase}] {step.description}")
+            elif event.event == "out" and event.chunk:
+                text = base64.b64decode(event.chunk).decode("utf-8", errors="replace")
+                self.log.line(f"  {text}")
+            elif event.event == "step_end" and event.id:
+                step = by_id.get(event.id)
+                executed.add(event.id)
+                duration = (event.duration_ms or 0) / 1000
+                if event.code not in (0, None):
+                    detail = f"exit code {event.code}"
+                    if event.result and event.result.state == "value":
+                        detail += f", result={event.result.text}"
+                    if event.tail:
+                        detail += f"\nlast output:\n{event.tail}"
+                    if step is not None and mark_phases:
+                        self._mark(step.phase, "failed")
+                    self.log.line(f"[{event.id}] FAILED: {detail}", style="red")
+                    raise PipelineError(
+                        f"step failed: {event.id} (exit code {event.code})"
+                    )
+                if step is not None and mark_phases:
+                    self._mark(step.phase, "ok")
+                if event.result and event.result.state != "unset":
+                    label: str = event.result.state
+                    if event.result.state == "value":
+                        label = event.result.text
+                    self.log.line(f"[{event.id}] result: {label} ({duration:.1f}s)")
+                else:
+                    self.log.line(f"[{event.id}] ok ({duration:.1f}s)")
+            elif event.event == "end":
+                self.end_code = event.code
+                if event.code == 3:
+                    self.interrupted = True
         if self.interrupted or self.end_code == 3:
             self.mark_interrupted()
             raise PipelineError("run interrupted; build marker retained for the next run")
         if self.end_code not in (0, None):
             raise PipelineError(f"probe exited with code {self.end_code}")
-        if len(executed) < len(steps):
+        if steps and len(executed) < len(steps):
             raise PipelineError("probe stopped before all steps completed")
 
-    def _run_target_via_dev(self, step: PlannedStep) -> None:
-        script = step.script
-        assert script is not None
-        path = self.pipeline.loaded.root / script.path
-        if not path.is_file():
-            raise PipelineError(f"script not found: {script.path}")
-        self._stage_started(step.stage)
-        target = self.ctx.target
-        self.log.line(f"[{step.stage}] target via dev: sh {script.path}")
-        outcome = run_target_script(
-            self.ctx.executor,
-            target.deploy.node,
-            path.read_bytes(),
-            target.deploy.path,
-            self.ctx.env,
-        )
-        for line in outcome.stdout.splitlines():
-            self.log.line(f"  {line}")
-        for line in outcome.stderr.splitlines():
-            self.log.line(f"  {line}")
-        if outcome.result:
-            self.log.line(f"[{step.stage}] result: {outcome.result}")
-        if outcome.code != 0:
-            self._mark(step.stage, "failed")
-            raise PipelineError(
-                f"step failed: {script.path} on target (exit code {outcome.code})"
-            )
-        self._mark(step.stage, "ok")
-        self.log.line(f"[{step.stage}] ok")
+    def _start_phases(self, steps: list[PlannedStep]) -> None:
+        for phase in dict.fromkeys(step.phase for step in steps):
+            self._stage_started(phase)
 
-    def _deploy_via_dev(self, step: PlannedStep) -> None:
-        target = self.ctx.target
-        self._stage_started("deploy")
-        self.log.line(
-            f"[deploy] relaying {self.ctx.remote_out} from build through dev "
-            f"-> {target.deploy.node}:{target.deploy.path}"
-        )
-        try:
-            chunks = self.ctx.probe.get_stream(self.ctx.remote_out)
-            push_stream_to_target(
-                self.ctx.executor,
-                target.deploy.node,
-                target.deploy.path,
-                chunks,
-            )
-        except Exception as exc:
-            self._mark("deploy", "failed")
-            raise PipelineError(f"artifact relay failed: {exc}") from exc
-        self._mark("deploy", "ok")
-        self.log.line("[deploy] ok")
+    def _mark_failed_phases(self, steps: list[PlannedStep]) -> None:
+        for phase in dict.fromkeys(step.phase for step in steps):
+            current = self.state.stages.get(phase)
+            if current is None or current.state == "running":
+                self._mark(phase, "failed")
 
-    def _exec_step(self, step: PlannedStep) -> ExecStep:
-        ctx = self.ctx
-        target = ctx.target
-        if step.where == "build":
-            env = dict(ctx.env)
-            result = False
-            if step.kind == "build_script":
-                assert step.script is not None
-                argv = ["sh", posix_join(target.build.workdir, step.script.path)]
-                result = True
-            elif step.kind in ("build", "transfer"):
-                assert step.command is not None
-                argv = ["sh", "-c", step.command]
-            else:
-                raise PipelineError(f"unsupported build step kind: {step.kind}")
-            return ExecStep(
-                id=self._exec_step_id(step),
-                where="build",
-                kind="shell",
-                argv=argv,
-                cwd=target.build.workdir,
-                env=env,
-                result=result,
-            )
-        script = step.script
-        assert script is not None
-        script_path = self.pipeline.loaded.root / script.path
-        if not script_path.is_file():
-            raise PipelineError(f"script not found: {script.path}")
-        return ExecStep(
-            id=self._exec_step_id(step),
-            where="target",
-            kind="script",
-            script_b64=base64.b64encode(script_path.read_bytes()).decode("ascii"),
-            cwd=target.deploy.path,
-            env=dict(ctx.env),
-            target_host=target.deploy.node,
-            result=True,
-        )
-
-    def _handle_event(
-        self, event: ExecEvent, steps: list[PlannedStep], executed: set[str]
-    ) -> None:
-        if event.event == "start":
-            if event.pid:
-                self.state.probe_pid = event.pid
-                save_state(self.state)
-        elif event.event == "end":
-            self.end_code = event.code
-            if event.code == 3:
-                self.interrupted = True
-        elif event.event == "lock" and event.code == 5:
-            raise PipelineError(
-                "another ferry run holds the build lock for this target; "
-                "wait for it to finish or cancel it explicitly"
-            )
-        elif event.event == "error":
-            raise PipelineError(f"probe error: {event.message or 'unknown error'}")
-        elif event.event == "recovery":
-            cleaned = event.cleaned or []
-            self.log.line(
-                f"[recovery] previous build was interrupted; cleaned: "
-                f"{', '.join(cleaned) or 'nothing'}",
-                style="yellow",
-            )
-        elif event.event == "step_start" and event.id:
-            step = self._lookup(event.id, steps)
-            self._stage_started(step.stage)
-            self.log.line(f"[{step.stage}] {step.where}: {step.description}")
-        elif event.event == "out" and event.chunk:
-            text = base64.b64decode(event.chunk).decode("utf-8", errors="replace")
-            self.log.line(f"  {text}")
-        elif event.event == "step_end" and event.id:
-            step = self._lookup(event.id, steps)
-            executed.add(event.id)
-            duration = (event.duration_ms or 0) / 1000
-            if event.code not in (0, None):
-                detail = f"exit code {event.code}"
-                if event.result and event.result.state == "value":
-                    detail += f", result={event.result.text}"
-                if event.tail:
-                    detail += f"\nlast output:\n{event.tail}"
-                status = "interrupted" if self.interrupted or event.code == 130 else "failed"
-                self._mark(step.stage, status)
-                self.log.line(f"[{step.stage}] FAILED: {detail}", style="red")
-                raise PipelineError(
-                    f"step failed: {step.description} on {step.where} "
-                    f"(exit code {event.code})"
-                )
-            self._mark(step.stage, "ok")
-            if event.result and event.result.state != "unset":
-                label: str = event.result.state
-                if event.result.state == "value":
-                    label = event.result.text
-                self.log.line(f"[{step.stage}] result: {label} ({duration:.1f}s)")
-            else:
-                self.log.line(f"[{step.stage}] ok ({duration:.1f}s)")
-
-    def _lookup(self, step_id: str, steps: list[PlannedStep]) -> PlannedStep:
-        for step in steps:
-            if self._exec_step_id(step) == step_id:
-                return step
-        return steps[0]
-
-    def _exec_step_id(self, step: PlannedStep) -> str:
-        if step.where == "build":
-            return f"{step.stage}:{step.kind}:{step.description}"
-        assert step.script is not None
-        return f"{step.stage}:{step.script.path}"
-
-    def _stage_started(self, stage: str) -> None:
-        self.state.stages[stage] = StageState(state="running", since=None)
+    def _stage_started(self, phase: str) -> None:
+        self.state.stages[phase] = StageState(state="running", since=None)
         save_state(self.state)
 
-    def _mark(self, stage: str, status: str) -> None:
-        self.state.stages[stage] = StageState(state=status)  # type: ignore[arg-type]
+    def _mark(self, phase: str, status: str) -> None:
+        self.state.stages[phase] = StageState(state=status)  # type: ignore[arg-type]
         save_state(self.state)
 
     def mark_interrupted(self) -> None:
-        for stage, stage_state in list(self.state.stages.items()):
+        for phase, stage_state in list(self.state.stages.items()):
             if stage_state.state == "running":
-                self.state.stages[stage] = StageState(state="interrupted")
+                self.state.stages[phase] = StageState(state="interrupted")
         save_state(self.state)
 
-    def _fail(self, step: PlannedStep, code: int, tail: str, result: str | None) -> None:
-        self._mark(step.stage, "failed")
-        detail = f"exit code {code}"
-        if result:
-            detail += f", result={result}"
-        if tail:
-            detail += f"\nlast output:\n{tail}"
-        self.log.line(f"[{step.stage}] FAILED: {detail}", style="red")
-        raise PipelineError(f"step failed: {step.description} on {step.where} (exit code {code})")
 
-
-def read_local_script_result(path: str) -> str | None:
-    try:
-        data = Path(path).read_bytes()
-    except OSError:
-        return None
-    if not data:
-        return "(empty)"
-    text = data.split(b"\n", 1)[0].decode("utf-8", errors="replace")
-    if len(text) > 512:
-        text = text[:512] + " (truncated)"
-    return text
-
-
-def build_environment(
-    project: str,
-    target_name: str,
-    build_info: NodeInfo,
-    target_info: NodeInfo,
-    toolchain_version: str | None,
-    overrides: dict[str, str] | None = None,
-) -> dict[str, str]:
-    env = {
-        "XB_PROJECT": project,
-        "XB_TARGET": target_name,
-        "XB_BUILD_ARCH": build_info.arch,
-        "XB_BUILD_OS": build_info.distro or build_info.os,
-        "XB_BUILD_OS_VER": build_info.os_ver,
-        "XB_TARGET_ARCH": target_info.arch,
-        "XB_TARGET_OS": target_info.distro or target_info.os,
-        "XB_TARGET_OS_VER": target_info.os_ver,
-        "XB_TARGET_INIT": target_info.init,
-        "XB_TARGET_GLIBC": target_info.glibc,
-        "XB_TARGET_HAS_RSYNC": "1" if target_info.has_rsync else "0",
-        "XB_TARGET_HAS_TAR": "1" if target_info.has_tar else "0",
-        "XB_TARGET_HAS_SCP": "1" if target_info.has_scp else "0",
-    }
-    if toolchain_version:
-        env["XB_BUILD_TOOLCHAIN_VER"] = toolchain_version
-    if overrides:
-        env.update(overrides)
-    env["XB_PROJECT"] = project
-    env["XB_TARGET"] = target_name
-    return {key: value for key, value in env.items() if value}
+def _local_workdir(value: str) -> str:
+    return value.replace("\\", "/")
 
 
 def render_plan(console: Console, ctx: PipelineContext, steps: list[PlannedStep]) -> None:
     console.print(f"target: {ctx.target_name}")
     console.print(f"route:  {ctx.route.name} ({ctx.route.description})")
     console.print(
-        f"nodes:  dev -> build={ctx.target.build.node} -> target={ctx.target.deploy.node}"
+        f"nodes:  dev -> build={ctx.resolved.build.display()} "
+        f"-> deploy={ctx.resolved.deploy.display()}"
     )
-    console.print("env:")
-    for key, value in sorted(ctx.env.items()):
-        console.print(f"  {key}={value}")
+    if ctx.env:
+        console.print("env:")
+        for key, value in sorted(masked_env(ctx.env).items()):
+            console.print(f"  {key}={value}")
     console.print("steps:")
     for index, step in enumerate(steps, start=1):
-        console.print(f"  {index:2d}. [{step.stage}] {step.where}: {step.description}")
+        console.print(f"  {index:2d}. [{step.phase}] {step.description}")
 
 
 __all__ = [
@@ -785,7 +799,6 @@ __all__ = [
     "PipelineContext",
     "PipelineError",
     "PlannedStep",
-    "build_environment",
     "posix_join",
     "render_plan",
 ]

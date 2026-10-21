@@ -15,6 +15,7 @@ from . import __version__
 from .executors import (
     ExecError,
     Executor,
+    Host,
     Process,
     explain_ssh_failure,
     remote_mkdir_and_upload,
@@ -203,7 +204,7 @@ def _install_bundled(
     return target, digest
 
 
-def detect_platform(executor: Executor, host: str) -> Platform:
+def detect_platform(executor: Executor, host: Host) -> Platform:
     result = executor.run(host, ["uname", "-m"], timeout=15)
     if result.returncode != 0:
         raise ProbeError(explain_ssh_failure(host, result.stderr_text))
@@ -228,7 +229,7 @@ def parse_version(text: str) -> ProbeVersion:
     raise ProbeError(f"probe did not return a version document: {text.strip()}")
 
 
-def handshake(executor: Executor, host: str, remote_path: str) -> ProbeVersion | None:
+def handshake(executor: Executor, host: Host, remote_path: str) -> ProbeVersion | None:
     result = executor.run(host, [remote_path, "version"], timeout=20)
     if result.returncode != 0:
         return None
@@ -241,7 +242,7 @@ def handshake(executor: Executor, host: str, remote_path: str) -> ProbeVersion |
 @dataclass
 class RemoteProbe:
     executor: Executor
-    host: str
+    host: Host
     path: str
     version: ProbeVersion
     _process: Process | None = None
@@ -343,7 +344,7 @@ class RemoteProbe:
 
 def ensure_remote_probe(
     executor: Executor,
-    host: str,
+    host: Host,
     workdir: str,
     *,
     platform: str | None = None,
@@ -388,7 +389,7 @@ def ensure_remote_probe(
     )
 
 
-def cancel_remote(executor: Executor, host: str, pids: list[int]) -> None:
+def cancel_remote(executor: Executor, host: Host, pids: list[int]) -> None:
     targets = " ".join(str(pid) for pid in pids if pid > 0)
     if not targets:
         return

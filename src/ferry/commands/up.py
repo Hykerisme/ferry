@@ -1,30 +1,32 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any, Literal, cast
 
 import typer
 from rich.console import Console
 
 from ..auth import resolve_credentials
-from ..bootstrap import BootstrapError, bootstrap_keys
+from ..bootstrap import BootstrapError, bootstrap_keys, ensure_local_key, install_public_key
 from ..config import (
     CONFIG_FILENAME,
+    PRIVATE_CONFIG_FILENAME,
     BuildCfg,
     ConfigError,
     DeployCfg,
-    StageScripts,
+    InlineNode,
     SyncCfg,
     TargetCfg,
-    ToolchainCfg,
-    add_target,
     config_to_yaml,
     diff_config,
     initial_config,
     load_config,
 )
 from ..executors import ExecError, SshExecutor, explain_ssh_failure
+from ..nodes import NodeSpec, resolve_target
 from ..paths import identity_path
-from ..pipeline import PipelineError, check_toolchain_version
+from ..private_config import dump_document, ensure_gitignore, load_document, regenerate_public
 from ..probe import ProbeError, ensure_remote_probe
 
 console = Console()
@@ -33,25 +35,70 @@ console = Console()
 def _pick(value: str | None, prompt: str, default: str | None = None) -> str:
     if value:
         return value
-    if default:
-        entered = typer.prompt(prompt, default=default)
-    else:
-        entered = typer.prompt(prompt)
+    entered = typer.prompt(prompt, default=default) if default else typer.prompt(prompt)
     return str(entered).strip()
 
 
-def _require_ssh(executor: SshExecutor, host: str, label: str) -> None:
-    result = executor.run(host, ["true"], timeout=15)
-    if result.returncode != 0:
-        raise typer.BadParameter(explain_ssh_failure(host, result.stderr_text), param_hint=label)
+def _node_input(
+    alias: str | None,
+    host: str | None,
+    user: str | None,
+    port: str | None,
+    existing: str | InlineNode | None,
+    label: str,
+) -> str | InlineNode:
+    if host:
+        return InlineNode(hostname=host, user=user, port=port)
+    if alias:
+        return alias
+    if existing is not None:
+        default = existing if isinstance(existing, str) else ""
+    else:
+        default = ""
+    entered = str(
+        typer.prompt(
+            f"{label} SSH alias (empty keeps current / use --{label}-host for inline)",
+            default=default,
+        )
+    ).strip()
+    if entered:
+        return entered
+    if existing is not None:
+        return existing
+    raise typer.BadParameter(f"{label} node is required")
 
 
-def _require_writable(executor: SshExecutor, host: str, path: str, label: str) -> None:
-    script = f"mkdir -p {shlex_quote(path)} && test -w {shlex_quote(path)}"
-    result = executor.run(host, ["sh", "-c", script], timeout=20)
+def _command_default(value: str | list[str] | None, fallback: str) -> str:
+    if isinstance(value, str):
+        return value
+    return fallback
+
+
+def _require_ssh(executor: SshExecutor, node: NodeSpec, label: str) -> None:
+    result = executor.run(node, ["true"], timeout=15)
     if result.returncode != 0:
         raise typer.BadParameter(
-            f"{label} {path!r} is not writable on {host}: {result.stderr_text.strip()}",
+            explain_ssh_failure(node, result.stderr_text), param_hint=label
+        )
+
+
+def _require_writable(
+    executor: SshExecutor | None, node: NodeSpec | None, path: str, label: str
+) -> None:
+    if node is None:
+        local = Path(path)
+        local.mkdir(parents=True, exist_ok=True)
+        if not os.access(local, os.W_OK):
+            raise typer.BadParameter(f"{label} {path!r} is not writable")
+        return
+    if executor is None:
+        raise typer.BadParameter(f"no executor for {label}")
+    script = f"mkdir -p {shlex_quote(path)} && test -w {shlex_quote(path)}"
+    result = executor.run(node, ["sh", "-c", script], timeout=20)
+    if result.returncode != 0:
+        raise typer.BadParameter(
+            f"{label} {path!r} is not writable on {node.display()}: "
+            f"{result.stderr_text.strip()}",
             param_hint=label,
         )
 
@@ -62,41 +109,52 @@ def shlex_quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def _set_or_remove(mapping: Any, key: str, value: Any) -> None:
+    if value is None:
+        mapping.pop(key, None)
+    else:
+        mapping[key] = value
+
+
 def up(
-    ssh: str | None = typer.Option(
-        None, "--ssh", help="build node SSH target or ~/.ssh/config alias"
+    ssh: str | None = typer.Option(None, "--ssh", help="build node SSH alias"),
+    build_host: str | None = typer.Option(None, "--build-host", help="inline build hostname"),
+    build_user: str | None = typer.Option(None, "--build-user", help="inline build user"),
+    build_port: str | None = typer.Option(None, "--build-port", help="inline build port"),
+    target: str | None = typer.Option(
+        None, "--target", help="deploy alias or dev.node/build.node"
     ),
-    target: str | None = typer.Option(None, "--target", help="target node SSH target"),
-    name: str | None = typer.Option(None, "--name", help="target alias used in .ferry.yaml"),
+    target_host: str | None = typer.Option(
+        None, "--target-host", help="inline deploy hostname"
+    ),
+    target_user: str | None = typer.Option(None, "--target-user", help="inline deploy user"),
+    target_port: str | None = typer.Option(None, "--target-port", help="inline deploy port"),
+    name: str | None = typer.Option(None, "--name", help="target alias in .ferry.yaml"),
     build_workdir: str | None = typer.Option(
-        None, "--build-workdir", help="writable dir on the build node"
+        None, "--build-workdir", help="absolute writable dir on build"
     ),
-    deploy_path: str | None = typer.Option(
-        None, "--deploy-path", help="writable dir on the target node"
+    out: list[str] = typer.Option(  # noqa: B008
+        [], "--out", help="artifact path relative to build.workdir (repeatable)"
     ),
-    toolchain_probe: str | None = typer.Option(
-        None, "--toolchain-probe", help="command printing the toolchain version"
+    run_build: str | None = typer.Option(None, "--run-build", help="build command"),
+    run_deploy: str | None = typer.Option(None, "--run-deploy", help="deploy command"),
+    deploy_workdir: str | None = typer.Option(
+        None, "--deploy-workdir", help="absolute dir on deploy"
     ),
-    toolchain_expect: str | None = typer.Option(
-        None, "--toolchain-expect", help="expected toolchain version"
+    transfer_from: str | None = typer.Option(
+        None, "--transfer-from", help="dev.node or build.node"
     ),
-    build_cmd: str | None = typer.Option(
-        None, "--build-cmd", help="build command (run on the build node)"
-    ),
-    out: str | None = typer.Option(
-        None, "--out", help="artifact directory relative to the build workdir"
-    ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y", help="accept the generated config without prompting"
-    ),
-    reset: bool = typer.Option(
-        False, "--reset", help="re-upload the probe binary to the build node"
-    ),
+    before_build: str | None = typer.Option(None, "--before-build"),
+    after_build: str | None = typer.Option(None, "--after-build"),
+    before_deploy: str | None = typer.Option(None, "--before-deploy"),
+    after_deploy: str | None = typer.Option(None, "--after-deploy"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="accept without prompting"),
+    reset: bool = typer.Option(False, "--reset", help="re-upload the probe"),
     ask_pass: bool = typer.Option(
         False, "--ask-pass", help="prompt for SSH passwords and install Ferry keys"
     ),
 ) -> None:
-    """Bootstrap a build/target pair and write it to .ferry.yaml."""
+    """Bootstrap a build/deploy pair and write .private.ferry.yaml."""
     try:
         loaded = load_config(Path.cwd())
         config = loaded.config
@@ -104,75 +162,155 @@ def up(
     except ConfigError:
         root = Path.cwd()
         config = initial_config(root.name)
-    config_path = root / CONFIG_FILENAME
 
     project = config.project.name or root.name
-    build_node = _pick(ssh, "Build node SSH target")
-    target_node = _pick(target, "Target node SSH target")
-    target_name = _pick(name, "Target alias", default="default")
+    default_name = next(iter(config.targets)) if len(config.targets) == 1 else "default"
+    target_name = _pick(name, "Target nickname", default=default_name)
     existing = config.targets.get(target_name)
-    workdir = _pick(
-        build_workdir,
-        "Writable directory on build node",
-        default=existing.build.workdir if existing else f"/work/{project}",
+
+    build_node = _node_input(
+        ssh,
+        build_host,
+        build_user,
+        build_port,
+        existing.build.node if existing else None,
+        "build",
     )
-    deploy_dir = _pick(
-        deploy_path,
-        "Writable directory on target node",
-        default=existing.deploy.path if existing else "/opt/app",
-    )
-    default_cmd = (
-        existing.build_cmd
-        if existing
-        else (
-            "cmake -B build && cmake --build build -j"
-            if (root / "CMakeLists.txt").is_file()
-            else "make -j"
-        )
-    )
-    command = _pick(build_cmd, "Build command", default=default_cmd)
-    artifact_dir = _pick(
-        out, "Artifact directory", default=existing.out if existing else "dist"
-    )
-    probe_cmd = (
-        toolchain_probe
-        if toolchain_probe is not None
-        else (existing.toolchain.probe if existing else None)
-    )
-    expected_version = (
-        toolchain_expect
-        if toolchain_expect is not None
-        else (existing.toolchain.expect if existing else None)
+    deploy_node = _node_input(
+        target,
+        target_host,
+        target_user,
+        target_port,
+        existing.deploy.node if existing else None,
+        "target",
     )
 
-    if not workdir.startswith("/") or not deploy_dir.startswith("/"):
-        console.print("[red]workdir and deploy path must be absolute paths[/red]")
-        raise typer.Exit(1)
+    workdir = _pick(
+        build_workdir,
+        "Writable directory on build",
+        default=(
+            existing.build.workdir if existing else f"/work/{project}"
+        ),
+    )
+    if out:
+        out_entries: str | list[str] = out[0] if len(out) == 1 else list(out)
+    elif existing is not None:
+        out_entries = existing.build.out
+    else:
+        entered = _pick(None, "Artifact path", default="./dist")
+        out_entries = entered
+
+    command = _pick(
+        run_build,
+        "Build command",
+        default=(
+            _command_default(
+                existing.build.run_build if existing else None,
+                "cmake -B build && cmake --build build -j"
+                if (root / "CMakeLists.txt").is_file()
+                else "make -j",
+            )
+        ),
+    )
+    deploy_dir = _pick(
+        deploy_workdir,
+        "Deploy directory",
+        default=existing.deploy.workdir if existing else "/opt/app",
+    )
+    deploy_command = _pick(
+        run_deploy,
+        "Deploy command",
+        default=_command_default(
+            existing.deploy.run_deploy if existing else None, "echo deployed"
+        ),
+    )
+
+    before_build_value = before_build or (
+        existing.build.before_build if existing else None
+    )
+    after_build_value = after_build or (existing.build.after_build if existing else None)
+    before_deploy_value = before_deploy or (
+        existing.deploy.before_deploy if existing else None
+    )
+    after_deploy_value = after_deploy or (
+        existing.deploy.after_deploy if existing else None
+    )
+    transfer_value = transfer_from or (
+        existing.deploy.transfer_from if existing else None
+    )
+    if transfer_value not in {None, "dev.node", "build.node"}:
+        raise typer.BadParameter("--transfer-from must be dev.node or build.node")
+
+    try:
+        target_config = TargetCfg(
+            sync=existing.sync if existing else SyncCfg(),
+            build=BuildCfg(
+                node=build_node,
+                workdir=workdir,
+                out=out_entries,
+                before_build=before_build_value,
+                run_build=command,
+                after_build=after_build_value,
+            ),
+            deploy=DeployCfg(
+                node=deploy_node,
+                transfer_from=cast(
+                    Literal["dev.node", "build.node"] | None, transfer_value
+                ),
+                workdir=deploy_dir,
+                before_deploy=before_deploy_value,
+                run_deploy=deploy_command,
+                after_deploy=after_deploy_value,
+            ),
+        )
+    except Exception as exc:
+        console.print(f"[red]invalid configuration:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        resolved = resolve_target(target_config)
+    except Exception as exc:
+        console.print(f"[red]cannot resolve nodes:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    for warning in resolved.warnings:
+        console.print(f"[yellow]warning:[/yellow] {warning}")
 
     credentials = resolve_credentials(ask=ask_pass)
     passwords: dict[str, str] = {}
     if credentials.build_password:
-        passwords[build_node] = credentials.build_password
+        passwords["build"] = credentials.build_password
     if credentials.target_password:
-        passwords[target_node] = credentials.target_password
+        passwords["deploy"] = credentials.target_password
     identity = str(identity_path()) if identity_path().is_file() else None
     executor = SshExecutor(
         accept_new_host_keys=True, passwords=passwords, identity=identity
     )
-    build_key = existing.build.ssh_key if existing else None
+
     try:
-        console.print(f"checking {build_node} ...")
-        _require_ssh(executor, build_node, "--ssh")
-        _require_writable(executor, build_node, workdir, "--build-workdir")
-        console.print(f"checking {target_node} ...")
-        _require_ssh(executor, target_node, "--target")
-        _require_writable(executor, target_node, deploy_dir, "--deploy-path")
+        console.print(f"checking build {resolved.build.display()} ...")
+        _require_ssh(executor, resolved.build, "--ssh")
+        _require_writable(executor, resolved.build, workdir, "--build-workdir")
+
+        if resolved.deploy_role == "external":
+            console.print(f"checking deploy {resolved.deploy.display()} ...")
+            _require_ssh(executor, resolved.deploy, "--target")
+            _require_writable(
+                executor, resolved.deploy, deploy_dir, "--deploy-workdir"
+            )
+        elif resolved.deploy_role == "build":
+            _require_writable(executor, resolved.build, deploy_dir, "--deploy-workdir")
+        else:
+            _require_writable(None, None, deploy_dir, "--deploy-workdir")
 
         if credentials.has_any:
-            if credentials.build_password and credentials.target_password:
-                try:
-                    build_key = bootstrap_keys(
-                        executor, build_node, target_node, credentials
+            try:
+                if (
+                    resolved.deploy_role == "external"
+                    and credentials.build_password
+                    and credentials.target_password
+                ):
+                    bootstrap_keys(
+                        executor, resolved.build, resolved.deploy, credentials
                     )
                     console.print(
                         "[green]installed Ferry SSH keys[/green]; "
@@ -181,61 +319,77 @@ def up(
                     executor = SshExecutor(
                         accept_new_host_keys=True, identity=str(identity_path())
                     )
-                except BootstrapError as exc:
-                    console.print(f"[yellow]key bootstrap skipped:[/yellow] {exc}")
-            else:
-                console.print(
-                    "[yellow]supplying only one password; "
-                    "no key bootstrap performed[/yellow]"
-                )
+                elif credentials.build_password:
+                    public = ensure_local_key()
+                    install_public_key(executor, resolved.build, public)
+                    console.print(
+                        "[yellow]installed the dev key on build only; "
+                        "target key setup skipped[/yellow]"
+                    )
+            except BootstrapError as exc:
+                console.print(f"[yellow]key bootstrap skipped:[/yellow] {exc}")
 
-        probe = ensure_remote_probe(executor, build_node, workdir, reset=reset)
-        info = probe.info()
-        console.print(
-            f"build node: {info.distro or info.os} {info.os_ver} {info.arch} "
-            f"init={info.init or 'unknown'} glibc={info.glibc or 'n/a'}"
+        probe = ensure_remote_probe(
+            executor, resolved.build, workdir, reset=reset
         )
-        if probe_cmd:
-            version = check_toolchain_version(
-                probe, build_node, workdir, probe_cmd, expected_version
-            )
-            console.print(f"toolchain: {version or '(no output)'}")
-    except (ExecError, ProbeError, PipelineError) as exc:
+        console.print(f"probe installed at {probe.path}")
+    except (ExecError, ProbeError) as exc:
         console.print(f"[red]bootstrap failed:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    if expected_version and not probe_cmd:
-        console.print("[red]--toolchain-expect requires --toolchain-probe[/red]")
-        raise typer.Exit(1)
+    new_targets = dict(config.targets)
+    new_targets[target_name] = target_config
+    new_config = config.model_copy(update={"targets": new_targets})
 
-    target_config = TargetCfg(
-        build=BuildCfg(
-            node=build_node,
-            workdir=workdir,
-            clean=existing.build.clean if existing else None,
-            ssh_key=build_key,
-        ),
-        deploy=DeployCfg(node=target_node, path=deploy_dir),
-        toolchain=ToolchainCfg(probe=probe_cmd, expect=expected_version),
-        build_cmd=command,
-        out=artifact_dir,
-        stages=existing.stages if existing else StageScripts(),
-        sync=existing.sync if existing else SyncCfg(),
-    )
-    new_config = add_target(
-        config, target_name, target_config, replace=existing is not None
-    )
-    new_text = config_to_yaml(new_config)
-    if config_path.is_file():
-        old_text = config_path.read_text(encoding="utf-8")
-        diff = diff_config(old_text, new_text)
+    private_path = root / PRIVATE_CONFIG_FILENAME
+    public_path = root / CONFIG_FILENAME
+    if private_path.is_file():
+        document = load_document(private_path)
+    elif public_path.is_file():
+        document = load_document(public_path)
+    else:
+        document = {"version": 1, "project": {"name": project}, "targets": {}}
+    if document is None:
+        document = {"version": 1, "project": {"name": project}, "targets": {}}
+    targets_doc = document.setdefault("targets", {})
+    target_doc = targets_doc.setdefault(target_name, {})
+
+    build_doc = target_doc.setdefault("build", {})
+    build_doc["node"] = _node_to_document(target_config.build.node)
+    build_doc["workdir"] = target_config.build.workdir
+    build_doc["out"] = target_config.build.out
+    _set_or_remove(build_doc, "before_build", target_config.build.before_build)
+    build_doc["run_build"] = target_config.build.run_build
+    _set_or_remove(build_doc, "after_build", target_config.build.after_build)
+
+    deploy_doc = target_doc.setdefault("deploy", {})
+    deploy_doc["node"] = _node_to_document(target_config.deploy.node)
+    _set_or_remove(deploy_doc, "transfer_from", target_config.deploy.transfer_from)
+    deploy_doc["workdir"] = target_config.deploy.workdir
+    _set_or_remove(deploy_doc, "before_deploy", target_config.deploy.before_deploy)
+    deploy_doc["run_deploy"] = target_config.deploy.run_deploy
+    _set_or_remove(deploy_doc, "after_deploy", target_config.deploy.after_deploy)
+
+    old_public = public_path.read_text(encoding="utf-8") if public_path.is_file() else ""
+    if document.get("project") is None:
+        document["project"] = {"name": project}
+    if not yes:
+        proposed = config_to_yaml(new_config)
+        diff = diff_config(old_public, proposed)
         if diff:
             console.print(diff, markup=False, highlight=False)
-    else:
-        console.print(new_text, markup=False, highlight=False)
-
-    if not yes and config_path.is_file():
-        typer.confirm("Write this configuration?", abort=True)
-    config_path.write_text(new_text, encoding="utf-8")
-    console.print(f"wrote {config_path}")
+        typer.confirm("Write these node settings?", abort=True)
+    dump_document(document, private_path)
+    regenerate_public(private_path, public_path)
+    added = ensure_gitignore(root)
+    if added:
+        console.print(f"added to .gitignore: {', '.join(added)}")
+    console.print(f"wrote {private_path}")
+    console.print(f"generated {public_path} (node definitions removed)")
     console.print(f"next: ferry plan {target_name}")
+
+
+def _node_to_document(value: str | InlineNode | None) -> Any:
+    if isinstance(value, InlineNode):
+        return value.model_dump(mode="json", exclude_none=True)
+    return value

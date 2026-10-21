@@ -60,6 +60,7 @@ class ExecRequest(BaseModel):
     workdir: str
     target_host: str | None = None
     target_key: str | None = None
+    target_options: list[str] = []
     lock: LockSpec | None = None
     marker: MarkerSpec | None = None
     clean_paths: list[str] = []

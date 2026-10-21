@@ -28,15 +28,16 @@ type Step struct {
 }
 
 type ExecRequest struct {
-	V          int         `json:"v"`
-	RunID      string      `json:"run_id"`
-	Workdir    string      `json:"workdir"`
-	TargetHost string      `json:"target_host"`
-	TargetKey  string      `json:"target_key"`
-	Lock       *LockSpec   `json:"lock"`
-	Marker     *MarkerSpec `json:"marker"`
-	CleanPaths []string    `json:"clean_paths"`
-	Steps      []Step      `json:"steps"`
+	V             int         `json:"v"`
+	RunID         string      `json:"run_id"`
+	Workdir       string      `json:"workdir"`
+	TargetHost    string      `json:"target_host"`
+	TargetKey     string      `json:"target_key"`
+	TargetOptions []string    `json:"target_options"`
+	Lock          *LockSpec   `json:"lock"`
+	Marker        *MarkerSpec `json:"marker"`
+	CleanPaths    []string    `json:"clean_paths"`
+	Steps         []Step      `json:"steps"`
 }
 
 type Result struct {

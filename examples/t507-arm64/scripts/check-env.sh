@@ -1,7 +1,8 @@
 #!/bin/sh
-# Runs on the build node after sync. Reports target facts back to Ferry.
-echo "target arch=$XB_TARGET_ARCH os=$XB_TARGET_OS $XB_TARGET_OS_VER init=$XB_TARGET_INIT"
+# Runs on the build node before the workspace is synced.
+# Use this for environment checks so a bad toolchain fails before the transfer.
+echo "build host: $(uname -s) $(uname -m)"
 
 if [ -n "${FERRY_RESULT_FILE:-}" ]; then
-    printf 'arch=%s init=%s\n' "$XB_TARGET_ARCH" "$XB_TARGET_INIT" > "$FERRY_RESULT_FILE"
+    printf 'arch=%s\n' "$(uname -m)" > "$FERRY_RESULT_FILE"
 fi

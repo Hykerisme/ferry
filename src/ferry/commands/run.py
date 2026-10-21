@@ -4,8 +4,9 @@ import typer
 from rich.console import Console
 
 from ..auth import resolve_credentials
-from ..config import ConfigError, load_config
+from ..config import ConfigError, NodeConfigMissing, load_config
 from ..executors import ExecError, SshExecutor
+from ..nodes import resolve_target
 from ..pipeline import Pipeline, PipelineError
 from ..probe import ProbeError, cancel_remote
 from ..state import load_state
@@ -38,22 +39,23 @@ def run(
         if state is None or (state.probe_pid is None and state.lock_pid is None):
             console.print(f"[yellow]no active run recorded for target {target!r}[/yellow]")
             raise typer.Exit(1)
-        host = state.build_node
-        if not host:
-            console.print("[red]state does not record the build node[/red]")
-            raise typer.Exit(1)
+        try:
+            target_cfg = loaded.config.targets[target]
+            resolved = resolve_target(target_cfg)
+        except (KeyError, NodeConfigMissing) as exc:
+            console.print(f"[red]cannot resolve build node:[/red] {exc}")
+            raise typer.Exit(1) from exc
         credentials = resolve_credentials(ask=ask_pass, need_target=False)
-        executor = SshExecutor(
-            passwords=(
-                {host: credentials.build_password}
-                if credentials.build_password
-                else None
-            )
+        passwords = (
+            {"build": credentials.build_password}
+            if credentials.build_password
+            else None
         )
+        executor = SshExecutor(passwords=passwords)
         pids = [pid for pid in (state.probe_pid, state.lock_pid) if pid]
-        cancel_remote(executor, host, pids)
+        cancel_remote(executor, resolved.build, pids)
         console.print(
-            f"sent SIGTERM to pids {pids} on {host}; "
+            f"sent SIGTERM to pids {pids} on {resolved.build.display()}; "
             "the build will finish its grace period"
         )
         return
@@ -64,7 +66,7 @@ def run(
             loaded, target, console=console, credentials=credentials
         )
         ctx = pipeline.prepare(refresh_topology=refresh_topology, reset_probe=reset_probe)
-        steps = pipeline.build_steps(via_dev=ctx.route.uses_dev_relay)
+        steps = pipeline.build_steps()
         pipeline.execute(ctx, steps)
     except (PipelineError, ProbeError, ExecError) as exc:
         console.print(f"[red]run failed:[/red] {exc}")

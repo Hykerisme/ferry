@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -212,5 +213,39 @@ func TestRunExecResultFile(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"state":"value"`) && !strings.Contains(out.String(), `"state": "value"`) {
 		t.Fatalf("expected result state, got %q", out.String())
+	}
+}
+
+func TestRunExecBuildScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("build script execution requires POSIX sh")
+	}
+	content := "#!/bin/sh\nprintf 'script-ok\\n'\nprintf 'val=1\\n' > \"$FERRY_RESULT_FILE\"\n"
+	request := ExecRequest{
+		V:       1,
+		RunID:   "test",
+		Workdir: t.TempDir(),
+		Steps: []Step{
+			{
+				ID:        "script",
+				Where:     "build",
+				Kind:      "script",
+				ScriptB64: base64.StdEncoding.EncodeToString([]byte(content)),
+				Cwd:       t.TempDir(),
+				Result:    true,
+			},
+		},
+	}
+	payload, _ := json.Marshal(request)
+	out := &bytes.Buffer{}
+	code := runExec(bytes.NewReader(payload), out, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("expected success, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), base64.StdEncoding.EncodeToString([]byte("script-ok"))) {
+		t.Fatalf("expected script output, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), `"text":"val=1"`) && !strings.Contains(out.String(), `"text": "val=1"`) {
+		t.Fatalf("expected script result, got %q", out.String())
 	}
 }
